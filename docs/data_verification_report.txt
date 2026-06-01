@@ -1,0 +1,56 @@
+Data Download Report - 20260226
+========================================
+
+Processing 日经ETF (513520.SH)...
+  Data Range: 20190625 to 20260225
+  Total Records: 1617
+  [OK] Start date aligned.
+  Saved to 513520.SH_日经ETF_history.csv
+
+Processing 纳指ETF (513100.SH)...
+  Data Range: 20130515 to 20260225
+  Total Records: 3105
+  [OK] Start date aligned.
+  Saved to 513100.SH_纳指ETF_history.csv
+
+Processing 港股科技ETF (513020.SH)...
+  Data Range: 20220208 to 20260225
+  Total Records: 981
+  [OK] Start date aligned.
+  Saved to 513020.SH_港股科技ETF_history.csv
+
+Processing 180ETF (510180.SH)...
+  Data Range: 20060518 to 20260225
+  Total Records: 4803
+  [OK] Start date aligned.
+  Saved to 510180.SH_180ETF_history.csv
+
+Processing 科创板ETF (588120.SH)...
+  Data Range: 20230915 to 20260225
+  Total Records: 587
+  [OK] Start date aligned.
+  Saved to 588120.SH_科创板ETF_history.csv
+
+Processing 创业板ETF (159915.SZ)...
+  Data Range: 20111209 to 20260225
+  Total Records: 3447
+  [OK] Start date aligned.
+  Saved to 159915.SZ_创业板ETF_history.csv
+
+Processing 南方原油(LOF) (501018.SH)...
+  Data Range: 20160628 to 20260225
+  Total Records: 2344
+  [OK] Start date aligned.
+  Saved to 501018.SH_南方原油(LOF)_history.csv
+
+Processing 黄金ETF (518880.SH)...
+  Data Range: 20130729 to 20260225
+  Total Records: 3056
+  [OK] Start date aligned.
+  Saved to 518880.SH_黄金ETF_history.csv
+
+Processing 30年国债ETF (511090.SH)...
+  Data Range: 20230613 to 20260225
+  Total Records: 653
+  [OK] Start date aligned.
+  Saved to 511090.SH_30年国债ETF_history.csv

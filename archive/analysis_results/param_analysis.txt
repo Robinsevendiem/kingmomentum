@@ -1,0 +1,48 @@
+
+--- Impact of Window Size ---
+        match_rate     return
+window                       
+20        0.703507  27.936255
+25        0.885403  21.789863
+
+--- Impact of Cutoff ---
+        match_rate     return
+cutoff                       
+300       0.739704  30.627588
+500       0.824123  23.257387
+700       0.819538  20.704203
+
+--- Impact of Buffer ---
+        match_rate     return
+buffer                       
+5         0.796171  26.105891
+8         0.794482  24.919856
+10        0.792712  23.563430
+
+--- Impact of Crash Filter ---
+              match_rate     return
+crash_filter                       
+False           0.814994  25.779296
+True            0.773917  23.946822
+
+--- Parameter Stability (Std Dev) ---
+Window Std: window
+20    2.656967
+25    9.817342
+Name: return, dtype: float64
+Cutoff Std: cutoff
+300     4.271997
+500     3.323796
+700    10.175530
+Name: return, dtype: float64
+
+--- Correlation Matrix ---
+                    window        cutoff  ...  match_rate    return
+window        1.000000e+00  1.182413e-16  ...    0.895207 -0.402522
+cutoff        1.182413e-16  1.000000e+00  ...    0.320807 -0.530620
+buffer        1.717544e-16  1.205551e-16  ...   -0.013786 -0.134449
+crash_filter  1.430954e-16 -2.900779e-17  ...   -0.202160 -0.120007
+match_rate    8.952066e-01  3.208068e-01  ...    1.000000 -0.494200
+return       -4.025217e-01 -5.306196e-01  ...   -0.494200  1.000000
+
+[6 rows x 6 columns]
