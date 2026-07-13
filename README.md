@@ -1,6 +1,6 @@
 # ETF Momentum Strategy Backtesting System
 
-基于 `Streamlit` 的 ETF 动量轮动回测与分析系统，包含策略回测、最新持仓信号、动量分布分析和参数评估页面。
+基于 `Streamlit` 的 ETF 动量轮动回测与分析系统，包含策略回测、最新持仓信号、动量分布分析、参数评估、交易时点对比和更新记录页面。
 
 ## 核心功能
 
@@ -8,14 +8,22 @@
 - 最新持仓：同步最新行情后，给出下一交易日建议持仓。
 - 动量分析：观察不同动量得分对应的价格曲线与收益分布。
 - 参数分析：读取预计算结果，展示多维绩效指标与稳健性结论。
+- 交易时点对比：对比信号日收盘成交与原始 T+1 开盘成交的净值、收益、回撤、交易记录与持仓明细。
+- 更新记录：集中展示项目功能迭代、页面优化与数据修复记录。
 - 标的池管理：支持用户自由增减参与轮动的标的，并可输入代码新增标的（自动下载历史数据并纳入轮动池）。
+- 数据更新修复：使用原始行情与复权因子重建前复权价格，避免 ETF 拆分、除权后复权序列断层。
 
 ## 目录结构
 
 ```text
 foolreveal/
 ├── Home.py                      # Streamlit 入口
+├── data_update_utils.py         # 历史数据更新与前复权重建工具
 ├── pages/                       # 子页面
+│   ├── 1_Momentum_Analysis.py   # 动量得分分析
+│   ├── 2_Parameter_Analysis.py  # 参数分析
+│   ├── 3_交易时点对比.py         # 不同交易时点绩效对比
+│   └── 4_更新记录.py             # 项目更新与修复记录
 ├── data/                        # 部署所需数据
 │   ├── *_history.csv            # ETF 历史行情
 │   ├── optimization_results.csv # 参数分析页依赖数据
@@ -30,6 +38,7 @@ foolreveal/
 │   ├── data_record/              # 回测导出的持仓/调仓记录（留痕）
 │   └── data_reference/           # 原始策略对照数据（留痕）
 ├── scripts/                     # 离线分析/优化脚本（线上不调用）
+│   └── update_local_data.py     # 本地批量更新历史数据
 ├── docs/                        # 说明文档
 ├── .streamlit/
 │   └── secrets.toml.example     # secrets 示例
@@ -63,6 +72,7 @@ TUSHARE_TOKEN = "你的真实 Tushare Token"
 - `data/optimization_results.csv`：参数分析页读取的预计算结果。
 - `data/active_pool.json`：当前轮动池（用户在侧边栏配置后持久化）。
 - `data/custom_assets.json`：自定义标的资产库（用户输入代码新增标的后持久化）。
+- `data_update_utils.py`：统一处理历史数据更新、复权因子读取和前复权价格重建。
 - `archive/`：历史分析产物与留痕数据归档，不影响主应用运行。
 
 ## 说明

@@ -9,6 +9,7 @@ import tushare as ts
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from data_update_utils import get_open_trade_end_date, update_history_file
 
 warnings.filterwarnings('ignore')
 
@@ -212,14 +213,7 @@ def update_data(token, force=False, assets=None):
     log_area = st.empty()
     logs = []
 
-    sh_now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    cal_end = sh_now.strftime('%Y%m%d')
-    cal_start = (sh_now - timedelta(days=60)).strftime('%Y%m%d')
-    try:
-        open_days = pro.trade_cal(exchange='', start_date=cal_start, end_date=cal_end, is_open='1')
-        today = str(open_days['cal_date'].max()) if open_days is not None and not open_days.empty else cal_end
-    except Exception:
-        today = cal_end
+    today = get_open_trade_end_date(pro)
     
     total_etfs = len(target_assets)
     
@@ -232,96 +226,28 @@ def update_data(token, force=False, assets=None):
         
         status_text.text(f"正在处理: {name} ({code})...")
         
-        # Determine start date
-        existing_df = None
-        
-        if not force and os.path.exists(filename):
-            try:
-                existing_df = pd.read_csv(filename)
-                # Ensure correct datetime parsing
-                if 'trade_date' in existing_df.columns:
-                    try:
-                        existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'], format='%Y%m%d')
-                    except:
-                        existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'])
-                        
-                if not existing_df.empty:
-                    last_date = existing_df['trade_date'].max()
-                    start_date = (last_date + timedelta(days=1)).strftime('%Y%m%d')
-            except Exception as e:
-                logs.append(f"读取现有文件 {filename} 失败: {e}")
-        
-        # Fetch Data
-        if not force and start_date > today:
-            logs.append(f"{name}: 数据已是最新。")
-        else:
-            try:
-                # Use retry logic
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        # Fetch unadjusted
-                        df_raw = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj=None, asset=asset_type)
-                        # Fetch adjusted (qfq)
-                        df_adj = ts.pro_bar(ts_code=code, start_date=start_date, end_date=today, adj='qfq', asset=asset_type)
-                        
-                        break # Success
-                    except Exception as e:
-                        if attempt == max_retries - 1:
-                            raise e
-                        time.sleep(1)
-                
-                if df_raw is not None and not df_raw.empty:
-                    if df_adj is None or df_adj.empty:
-                        df_adj = df_raw.copy()
-                    
-                    df_raw = df_raw.set_index('trade_date').sort_index()
-                    df_adj = df_adj.set_index('trade_date').sort_index()
-                    
-                    adj_cols = ['open', 'high', 'low', 'close']
-                    existing_adj_cols = [c for c in adj_cols if c in df_adj.columns]
-                    df_adj_subset = df_adj[existing_adj_cols].rename(columns={c: f'adj_{c}' for c in existing_adj_cols})
-                    
-                    df_new = df_raw.join(df_adj_subset, how='left').reset_index()
-                    df_new['trade_date'] = pd.to_datetime(df_new['trade_date'], format='%Y%m%d')
-                    
-                    # Merge
-                    if existing_df is not None:
-                        # Ensure types match
-                        # existing_df already has datetime trade_date
-                        df_final = pd.concat([existing_df, df_new], ignore_index=True)
-                        df_final.drop_duplicates(subset=['trade_date'], inplace=True)
-                    else:
-                        df_final = df_new
-                        
-                    df_final.sort_values('trade_date', inplace=True)
-                    # Save back with %Y%m%d format for consistency if needed, but pandas saves default format. 
-                    # Original script read/write cycle might change format. 
-                    # Let's ensure trade_date is saved in a way readable by read_csv later.
-                    # Original script: to_csv index=False.
-                    # Standard pandas to_csv saves datetime as YYYY-MM-DD.
-                    # Our load function uses: pd.to_datetime(df['trade_date'], format='%Y%m%d')
-                    # Wait, original script saved as default (likely YYYY-MM-DD or whatever).
-                    # But load function specifies format='%Y%m%d'. 
-                    # If pandas saves as YYYY-MM-DD, load might fail if format is strict.
-                    # Let's check original script:
-                    # df['trade_date'] in tushare is usually string 'YYYYMMDD'.
-                    # In download_etf_data.py: df_final.to_csv(...)
-                    # It doesn't convert to datetime object before saving. So it saves 'YYYYMMDD' strings.
-                    # My update logic converted to datetime: df_new['trade_date'] = pd.to_datetime(...)
-                    # So I should convert back to 'YYYYMMDD' string before saving to match original format.
-                    
-                    df_final['trade_date'] = df_final['trade_date'].dt.strftime('%Y%m%d')
-                    dir_name = os.path.dirname(filename)
-                    if dir_name:
-                        os.makedirs(dir_name, exist_ok=True)
-                    df_final.to_csv(filename, index=False, encoding='utf-8-sig')
-                    max_td = df_final['trade_date'].max() if 'trade_date' in df_final.columns else ''
-                    logs.append(f"{name}: 更新 {len(df_new)} 条，最新日期 {max_td}。")
-                else:
-                    logs.append(f"{name}: 无新数据。")
-            except Exception as e:
-                logs.append(f"{name} 更新失败: {e}")
+        try:
+            result = update_history_file(
+                file_path=filename,
+                ts_code=code,
+                asset_type=asset_type,
+                start_date=start_date,
+                end_date=today,
+                force=force,
+                pro=pro,
+            )
+            if result["status"] == "no_data":
+                logs.append(f"{name}: 未获取到可用数据。")
+            elif result["status"] == "adj_refreshed":
+                logs.append(
+                    f"{name}: 无新增原始数据，已基于复权因子全量重建前复权列，最新日期 {result['new_max']}。"
+                )
+            else:
+                logs.append(
+                    f"{name}: 新增 {result['new_rows']} 条，已基于复权因子重建前复权列 {result['adj_rows']} 条，复权因子 {result['factor_rows']} 条，最新日期 {result['new_max']}。"
+                )
+        except Exception as e:
+            logs.append(f"{name} 更新失败: {e}")
         
         progress_bar.progress((i + 1) / total_etfs)
         time.sleep(0.1) # Be nice to API
@@ -641,14 +567,20 @@ def run_backtest(history_data, raw_scores_df, params):
 
         cum_ret_pct = (nav_open / params['initial_capital']) - 1
 
+        min_trade_shares = 1e-8
+        min_trade_amount = 1e-6
+
         def _sell(asset, shares_to_sell, price):
             nonlocal cash
-            if shares_to_sell <= 0:
+            if shares_to_sell <= min_trade_shares or price <= 0:
+                return
+            gross_amount = shares_to_sell * price
+            if gross_amount <= min_trade_amount:
                 return
             proceeds = shares_to_sell * price * (1 - fee)
             cash += proceeds
             holdings[asset] = holdings.get(asset, 0) - shares_to_sell
-            if holdings.get(asset, 0) <= 0:
+            if holdings.get(asset, 0) <= min_trade_shares:
                 holdings.pop(asset, None)
 
             pnl_amount = np.nan
@@ -675,14 +607,16 @@ def run_backtest(history_data, raw_scores_df, params):
 
         def _buy(asset, shares_to_buy, price):
             nonlocal cash
-            if shares_to_buy <= 0:
+            if shares_to_buy <= min_trade_shares or price <= 0:
                 return
             max_shares = cash / (price * (1 + fee)) if price > 0 else 0
             shares_to_buy = min(shares_to_buy, max_shares)
-            if shares_to_buy <= 0:
+            if shares_to_buy <= min_trade_shares:
                 return
 
             cost = shares_to_buy * price * (1 + fee)
+            if cost <= min_trade_amount:
+                return
             cash -= cost
 
             prev_shares = holdings.get(asset, 0.0)
