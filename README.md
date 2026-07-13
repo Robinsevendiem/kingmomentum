@@ -42,7 +42,9 @@ foolreveal/
 ├── docs/                        # 说明文档
 ├── .streamlit/
 │   └── secrets.toml.example     # secrets 示例
+├── runtime.txt                  # Streamlit Cloud Python 版本
 ├── requirements.txt
+├── requirements-dev.txt         # 本地研究/离线脚本附加依赖
 └── README.md
 ```
 
@@ -51,6 +53,12 @@ foolreveal/
 ```bash
 pip install -r requirements.txt
 streamlit run Home.py
+```
+
+如需运行离线研究脚本，可额外安装：
+
+```bash
+pip install -r requirements-dev.txt
 ```
 
 ## Streamlit Cloud 部署
@@ -65,6 +73,7 @@ TUSHARE_TOKEN = "你的真实 Tushare Token"
 ```
 
 5. 部署后应用会自动从 `st.secrets` 读取 Token；本地也可在侧边栏手动输入。
+6. 当前部署已固定 `runtime.txt` 与 `requirements.txt`，用于减少云端环境差异导致的启动失败。
 
 ## 数据说明
 

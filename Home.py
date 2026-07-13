@@ -16,8 +16,6 @@ warnings.filterwarnings('ignore')
 # --- Page Config ---
 st.set_page_config(page_title="ETF 动量策略回测系统", layout="wide", page_icon="📈")
 
-import statsmodels.api as sm
-
 CUSTOM_ASSETS_PATH = "data/custom_assets.json"
 ACTIVE_POOL_PATH = "data/active_pool.json"
 
