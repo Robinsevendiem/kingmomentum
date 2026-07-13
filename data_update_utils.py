@@ -211,6 +211,18 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
     existing_df = pd.DataFrame() if force else read_history_csv(file_path)
     old_max = existing_df["trade_date"].max() if not existing_df.empty and "trade_date" in existing_df.columns else ""
 
+    if not force and old_max and str(old_max) >= str(end_date):
+        return {
+            "file_path": file_path,
+            "ts_code": ts_code,
+            "asset_type": asset_type,
+            "old_max": str(old_max),
+            "new_max": str(old_max),
+            "rows": int(len(existing_df)),
+            "updated": False,
+            "reason": "up_to_date",
+        }
+
     raw_start = start_date
     if not force and old_max:
         raw_start = (datetime.strptime(old_max, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
@@ -225,13 +237,20 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
             adj=None,
         )
 
-    raw_full_df = fetch_pro_bar_chunked(
-        ts_code=ts_code,
-        start_date=start_date,
-        end_date=end_date,
-        asset=asset_type,
-        adj=None,
-    )
+    raw_frames = []
+    if existing_df is not None and not existing_df.empty:
+        existing_raw_cols = [c for c in existing_df.columns if not c.startswith("adj_")]
+        if existing_raw_cols:
+            raw_frames.append(existing_df[existing_raw_cols].copy())
+    if raw_incremental_df is not None and not raw_incremental_df.empty:
+        raw_frames.append(raw_incremental_df.copy())
+
+    raw_full_df = pd.DataFrame()
+    if raw_frames:
+        raw_full_df = pd.concat(raw_frames, ignore_index=True)
+        raw_full_df = normalize_trade_date_frame(raw_full_df)
+        raw_full_df.drop_duplicates(subset=["trade_date"], keep="last", inplace=True)
+        raw_full_df.sort_values("trade_date", inplace=True)
 
     factor_df = pd.DataFrame()
     if pro is not None and asset_type in {"FD", "E"}:
