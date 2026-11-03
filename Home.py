@@ -1199,7 +1199,7 @@ def get_strategy_params():
         'initial_capital': initial_capital
     }
 
-def render_latest_holding_page():
+def render_latest_holding_page(auto_refresh=False):
     st.title("🔔 最新持仓信号")
     
     # Hidden Link Button
@@ -1222,9 +1222,10 @@ def render_latest_holding_page():
     # Sidebar
     params = get_strategy_params()
     
-    st.info("点击下方按钮，系统将获取最新数据，并根据当前策略参数计算下一个交易日的建议持仓。")
-    
-    if st.button("🔍 检查并获取最新信号", type="primary"):
+    st.info("首次进入本页时会自动同步最新数据并计算建议持仓；页面内调整参数不会重复联网，可点击按钮手动刷新。")
+
+    refresh_clicked = st.button("🔄 重新同步数据并计算最新信号", type="primary")
+    if auto_refresh or refresh_clicked:
         # 1. Update Data
         ts_token = get_tushare_token()
         if not ts_token:
@@ -1257,84 +1258,101 @@ def render_latest_holding_page():
             if not timeline:
                 st.error("无法计算信号，请检查数据或日期范围。")
                 return
+            # 将结果与本次使用的参数一起保存，避免 Streamlit 控件重跑时重复请求行情。
+            st.session_state['latest_holding_result'] = {
+                'last_dt': timeline[-1],
+                'last_signal': last_signal,
+                'scores_df': scores_df,
+                'rsrs_df': rsrs_df,
+                'params': params,
+                'refreshed_at': pd.Timestamp.now(),
+            }
 
-            # 4. Display Result
-            last_dt = timeline[-1]
-            latest_date = last_dt.strftime('%Y-%m-%d')
-            next_holding = last_signal.get('next_holding', '现金')
-            next_score = last_signal.get('score', 0)
-            next_holdings = last_signal.get('next_holdings', [])
-            next_scores = last_signal.get('scores', {})
-            
-            st.divider()
-            st.markdown(f"### 📅 数据日期: {latest_date}")
-            
-            # Big Display
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("#### 建议持仓 (T+1)")
-                if next_holding == '现金':
-                    st.warning(f"### 💵 {next_holding}")
+    result = st.session_state.get('latest_holding_result')
+    if not result:
+        st.info("进入本页后会自动同步数据并计算最新信号；如果自动更新失败，可检查 Token 后点击上方按钮重试。")
+        return
+
+    # 4. Display the most recently calculated result.
+    last_dt = result['last_dt']
+    last_signal = result['last_signal']
+    scores_df = result['scores_df']
+    rsrs_df = result['rsrs_df']
+    result_params = result['params']
+    latest_date = last_dt.strftime('%Y-%m-%d')
+    next_holding = last_signal.get('next_holding', '现金')
+    next_score = last_signal.get('score', 0)
+    next_holdings = last_signal.get('next_holdings', [])
+    next_scores = last_signal.get('scores', {})
+
+    refreshed_at = result.get('refreshed_at')
+    if refreshed_at is not None:
+        st.caption(
+            f"最近同步：{refreshed_at.strftime('%Y-%m-%d %H:%M:%S')}；结果按此次同步时的策略参数计算。"
+            "调整参数后，请点击上方按钮重新同步并计算。"
+        )
+
+    st.divider()
+    st.markdown(f"### 📅 数据日期: {latest_date}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### 建议持仓 (T+1)")
+        if next_holding == '现金':
+            st.warning(f"### 💵 {next_holding}")
+        else:
+            st.success(f"### 🚀 {next_holding}")
+
+    with col2:
+        if next_holdings:
+            st.markdown("#### 动量得分")
+            st.write(" | ".join([f"{a}: {float(next_scores.get(a, 0)):.1f}" for a in next_holdings]))
+        else:
+            st.markdown("#### 动量得分")
+            st.metric("Score", f"{float(next_score):.1f}")
+
+    st.divider()
+    st.markdown("#### 📊 当日标的得分详情")
+
+    if last_dt in scores_df.index:
+        today_scores = scores_df.loc[last_dt].dropna().sort_values(ascending=False)
+        details = []
+        for asset, score in today_scores.items():
+            name_to_code_disp = result_params.get("name_to_code", {}) or {}
+            asset_code = name_to_code_disp.get(asset)
+            cutoff_val = float(result_params.get("fallback_cutoff", 300))
+            if asset_code and 'user_cutoffs' in result_params and asset_code in result_params['user_cutoffs']:
+                cutoff_val = float(result_params['user_cutoffs'][asset_code])
+
+            status = "✅ 候选"
+            if score > cutoff_val:
+                status = f"🚫 过热 (>{cutoff_val})"
+            elif score <= 0:
+                status = "📉 负动量"
+
+            rsrs_val = np.nan
+            if last_dt in rsrs_df.index and asset in rsrs_df.columns:
+                rsrs_val = rsrs_df.loc[last_dt, asset]
+            rsrs_str = f"{rsrs_val:.2f}" if not np.isnan(rsrs_val) else "-"
+
+            rsrs_status = ""
+            if not np.isnan(rsrs_val):
+                if rsrs_val > 0.7:
+                    rsrs_status = "🔥 强势"
+                elif rsrs_val < -0.7:
+                    rsrs_status = "🧊 弱势"
                 else:
-                    st.success(f"### 🚀 {next_holding}")
-            
-            with col2:
-                if next_holdings:
-                    st.markdown("#### 动量得分")
-                    st.write(" | ".join([f"{a}: {float(next_scores.get(a, 0)):.1f}" for a in next_holdings]))
-                else:
-                    st.markdown("#### 动量得分")
-                    st.metric("Score", f"{float(next_score):.1f}")
-                
-            st.divider()
-            
-            # Show details of candidates
-            st.markdown("#### 📊 当日标的得分详情")
-            
-            if last_dt in scores_df.index:
-                today_scores = scores_df.loc[last_dt].dropna().sort_values(ascending=False)
-                
-                # Format for display
-                details = []
-                for asset, score in today_scores.items():
-                    name_to_code_disp = params.get("name_to_code", {}) or {}
-                    asset_code = name_to_code_disp.get(asset)
-                    cutoff_val = float(params.get("fallback_cutoff", 300))
-                    if asset_code and 'user_cutoffs' in params and asset_code in params['user_cutoffs']:
-                        cutoff_val = float(params['user_cutoffs'][asset_code])
-                        
-                    status = "✅ 候选"
-                    if score > cutoff_val:
-                        status = f"🚫 过热 (>{cutoff_val})"
-                    elif score <= 0:
-                        status = "📉 负动量"
-                        
-                    # Get RSRS
-                    rsrs_val = np.nan
-                    if last_dt in rsrs_df.index and asset in rsrs_df.columns:
-                        rsrs_val = rsrs_df.loc[last_dt, asset]
-                        
-                    rsrs_str = f"{rsrs_val:.2f}" if not np.isnan(rsrs_val) else "-"
-                    
-                    # RSRS Status
-                    rsrs_status = ""
-                    if not np.isnan(rsrs_val):
-                        if rsrs_val > 0.7:
-                            rsrs_status = "🔥 强势"
-                        elif rsrs_val < -0.7:
-                            rsrs_status = "🧊 弱势"
-                        else:
-                            rsrs_status = "↔️ 震荡"
-                        
-                    details.append({
-                        '标的': asset,
-                        '动量得分': f"{score:.1f}",
-                        'RSRS指标': f"{rsrs_str} {rsrs_status}",
-                        '熔断阈值': cutoff_val,
-                        '状态': status
-                    })
-                
-                st.dataframe(pd.DataFrame(details))
+                    rsrs_status = "↔️ 震荡"
+
+            details.append({
+                '标的': asset,
+                '动量得分': f"{score:.1f}",
+                'RSRS指标': f"{rsrs_str} {rsrs_status}",
+                '熔断阈值': cutoff_val,
+                '状态': status
+            })
+
+        st.dataframe(pd.DataFrame(details))
 
 def calculate_thermometer(df):
     """
@@ -1882,11 +1900,16 @@ def render_backtest_page():
 
 # --- Main App Logic ---
 st.sidebar.title("导航")
-page = st.sidebar.radio("选择页面", ["回测系统", "最新持仓标的", "策略介绍"], index=0)
+page = st.sidebar.radio("选择页面", ["回测系统", "最新持仓标的", "策略介绍"], index=1)
+
+# 只在本次会话首次打开或重新切入最新持仓页时自动刷新，避免控件交互触发重复联网请求。
+previous_page = st.session_state.get('previous_main_page')
+entering_latest_page = page == "最新持仓标的" and previous_page != page
+st.session_state['previous_main_page'] = page
 
 if page == "回测系统":
     render_backtest_page()
 elif page == "最新持仓标的":
-    render_latest_holding_page()
+    render_latest_holding_page(auto_refresh=entering_latest_page)
 elif page == "策略介绍":
     render_intro_page()
