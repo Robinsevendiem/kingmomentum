@@ -9,8 +9,8 @@ import tushare as ts
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from data_update_utils import get_open_trade_end_date, update_history_file
-from intraday_quotes import fetch_intraday_quotes
+from data_update_utils import get_open_trade_dates, get_open_trade_end_date, read_history_csv, update_history_file
+from intraday_quotes import fetch_eastmoney_daily_history, fetch_intraday_quotes
 
 warnings.filterwarnings('ignore')
 
@@ -114,7 +114,6 @@ def lookup_asset_basic(_token: str, ts_code: str):
     if not ts_code:
         return None
 
-    ts.set_token(_token)
     pro = ts.pro_api(_token)
 
     try:
@@ -189,73 +188,233 @@ def add_custom_asset(token: str, ts_code: str):
     return item, ""
 
 # --- Helper: Data Update ---
-def update_data(token, force=False, assets=None):
-    """
-    Update ETF data using Tushare.
-    force: If True, re-download all data from scratch.
-    """
+def update_data(token, force=False, assets=None, required_window=25, allow_online_fallback=False):
+    """增量更新到最近完整交易日，并校验动量窗口覆盖后再报告可用。"""
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     if not token or not str(token).strip():
-        st.error("未配置 Tushare Token，无法更新数据。请在侧边栏输入 Token 或在 Streamlit Cloud Secrets 配置 TUSHARE_TOKEN。")
+        report = {
+            "ready": False,
+            "as_of_date": today.strftime("%Y%m%d"),
+            "target_date": None,
+            "coverage": {},
+            "failures": ["未配置 Tushare Token"],
+            "warnings": [],
+        }
+        st.session_state["market_data_sync_report"] = report
+        message = "未配置 Tushare Token，模拟时将尝试通过东方财富在线日线获取完整历史窗口。" if allow_online_fallback else "未配置 Tushare Token，无法确认历史数据完整性。"
+        (st.warning if allow_online_fallback else st.error)(message)
         return False
 
     try:
-        ts.set_token(token)
+        # pro_api(token) 直接在内存中使用凭据，不写入用户目录的 tk.csv。
         pro = ts.pro_api(token)
-    except Exception as e:
-        st.error(f"Tushare 初始化失败: {e}")
+        target_date = get_open_trade_end_date(pro)
+        calendar_start = (
+            pd.to_datetime(target_date, format="%Y%m%d") - pd.Timedelta(days=180)
+        ).strftime("%Y%m%d")
+        expected_dates = get_open_trade_dates(pro, calendar_start, target_date)
+    except Exception as exc:
+        report = {
+            "ready": False,
+            "as_of_date": today.strftime("%Y%m%d"),
+            "target_date": None,
+            "coverage": {},
+            "failures": [f"无法确认最近完整交易日：{exc}"],
+            "warnings": [],
+        }
+        st.session_state["market_data_sync_report"] = report
+        message = "Tushare 交易日历不可用，模拟时将尝试通过东方财富日线构造历史窗口。" if allow_online_fallback else "Tushare 交易日历不可用，未使用可能过期的数据计算信号。"
+        (st.warning if allow_online_fallback else st.error)(message)
         return False
 
     target_assets = assets if isinstance(assets, list) and assets else get_all_assets_config()
-
     progress_bar = st.progress(0)
     status_text = st.empty()
-    log_area = st.empty()
     logs = []
+    warnings_list = []
+    failures = []
+    coverage = {}
+    window_dates = expected_dates[-max(1, int(required_window)):]
 
-    today = get_open_trade_end_date(pro)
-    
-    total_etfs = len(target_assets)
-    
-    for i, a in enumerate(target_assets):
-        code = str(a.get("code", "")).strip()
-        name = str(a.get("name", "")).strip()
-        filename = str(a.get("file_path", "")).strip() or f"data/{code}_{name}_history.csv"
-        start_date = str(a.get("start_date", "")).strip() or "19900101"
-        asset_type = str(a.get("asset_type", "FD")).strip() or "FD"
-        
+    for i, asset in enumerate(target_assets):
+        code = str(asset.get("code", "")).strip()
+        name = str(asset.get("name", "")).strip()
+        filename = str(asset.get("file_path", "")).strip() or f"data/{code}_{name}_history.csv"
+        start_date = str(asset.get("start_date", "")).strip() or "19900101"
+        asset_type = str(asset.get("asset_type", "FD")).strip() or "FD"
         status_text.text(f"正在处理: {name} ({code})...")
-        
+
+        applicable_dates = [date for date in window_dates if date >= start_date]
+        before = read_history_csv(filename)
+        def valid_price_dates(frame):
+            if frame.empty or "close" not in frame.columns:
+                return set()
+            raw_prices = pd.to_numeric(frame["close"], errors="coerce")
+            adjusted_col = "adj_close" if "adj_close" in frame.columns else "close"
+            adjusted_prices = pd.to_numeric(frame[adjusted_col], errors="coerce")
+            valid = raw_prices.gt(0) & adjusted_prices.gt(0)
+            return set(frame.loc[valid, "trade_date"].astype(str))
+
+        before_dates = valid_price_dates(before)
+        missing_before = [date for date in applicable_dates if date not in before_dates]
+        repair_start_date = min(missing_before) if missing_before else None
+        update_error = None
         try:
             result = update_history_file(
                 file_path=filename,
                 ts_code=code,
                 asset_type=asset_type,
                 start_date=start_date,
-                end_date=today,
+                end_date=target_date,
                 force=force,
                 pro=pro,
+                repair_start_date=repair_start_date,
             )
-            if result["status"] == "no_data":
-                logs.append(f"{name}: 未获取到可用数据。")
-            elif result["status"] == "adj_refreshed":
-                logs.append(
-                    f"{name}: 无新增原始数据，已基于复权因子全量重建前复权列，最新日期 {result['new_max']}。"
-                )
+            logs.append(
+                f"{name}：状态 {result.get('status', result.get('reason', '未知'))}，"
+                f"最新日期 {result.get('new_max', '无')}，新增 {result.get('new_rows', 0)} 条。"
+            )
+        except Exception as exc:
+            update_error = str(exc)
+
+        after = read_history_csv(filename)
+        after_dates = valid_price_dates(after)
+        missing_after = [date for date in applicable_dates if date not in after_dates]
+        latest_date = max(after_dates) if after_dates else ""
+        coverage[code] = {
+            "name": name,
+            "latest_date": latest_date,
+            "required_dates": applicable_dates,
+            "missing_dates": missing_after,
+            "needs_fallback": bool(latest_date < target_date or missing_after),
+        }
+        if latest_date < target_date or missing_after:
+            missing_text = f"缺少交易日 {', '.join(missing_after)}" if missing_after else f"最新日期落后于目标日 {target_date}"
+            failures.append(f"{name} ({code})：{missing_text}")
+            if update_error:
+                failures[-1] += f"；更新错误：{update_error}"
+        elif update_error:
+            warnings_list.append(f"{name} 更新请求失败，但本地数据已覆盖所需窗口：{update_error}")
+
+        progress_bar.progress((i + 1) / max(1, len(target_assets)))
+        time.sleep(0.1)
+
+    ready = not failures
+    report = {
+        "ready": ready,
+        "as_of_date": today.strftime("%Y%m%d"),
+        "target_date": target_date,
+        "coverage": coverage,
+        "failures": failures,
+        "warnings": warnings_list,
+    }
+    st.session_state["market_data_sync_report"] = report
+    status_text.text("历史行情校验完成")
+    with st.expander("查看行情更新与覆盖校验日志"):
+        st.write(logs + warnings_list + failures)
+    if ready:
+        st.success(f"本地行情已覆盖完整的 {required_window} 个观测窗口，基准收盘日：{target_date}。")
+    elif allow_online_fallback:
+        st.warning(f"Tushare 历史校验未通过（目标日：{target_date}），盘中模拟将继续尝试东方财富在线日线补数。")
+    else:
+        st.error(f"历史行情未通过完整性校验，目标收盘日：{target_date}；暂不应据此计算信号或盘中分数。")
+    return ready
+
+
+def prepare_simulation_history(assets, quote_day, window, sync_report):
+    """构造本次盘中计算用历史；东方财富补数仅保存在内存中，不写入 CSV。"""
+    history_data = load_history_data()
+    coverage = sync_report.get("coverage") or {}
+    target_date = sync_report.get("target_date")
+    end_date = target_date or (pd.Timestamp(quote_day) - pd.Timedelta(days=1)).strftime("%Y%m%d")
+    end_ts = pd.to_datetime(end_date, format="%Y%m%d")
+    start_date = (end_ts - pd.Timedelta(days=240)).strftime("%Y%m%d")
+    history_sources = {}
+    errors = []
+
+    for asset in assets:
+        name = str(asset.get("name", "")).strip()
+        code = str(asset.get("code", "")).strip()
+        local = history_data.get(name, pd.DataFrame()).copy()
+        if not local.empty:
+            local = local.loc[local.index < pd.Timestamp(quote_day)].copy()
+        asset_coverage = coverage.get(code, {})
+        required_dates = asset_coverage.get("required_dates", [])
+        missing_dates = asset_coverage.get("missing_dates", [])
+        needs_fallback = bool(asset_coverage.get("needs_fallback", not sync_report.get("ready")))
+
+        if not needs_fallback and not local.empty:
+            local["_price_source"] = "Tushare 本地历史"
+            history_data[name] = local
+            history_sources[name] = "Tushare 本地历史"
+            continue
+
+        try:
+            online = fetch_eastmoney_daily_history(code, start_date, end_date)
+            online = online.loc[online.index < pd.Timestamp(quote_day)].copy()
+            if online.empty:
+                raise ValueError("返回数据中没有报价日前的日线")
+
+            # 东方财富前复权序列与 Tushare 的复权基准可能不同；以最近共同有效日对齐尺度。
+            if not local.empty and "adj_close" in local.columns:
+                local_adj = pd.to_numeric(local["adj_close"], errors="coerce")
+                common_dates = local_adj.index.intersection(online.index)
+                common = pd.DataFrame({
+                    "local": local_adj.reindex(common_dates),
+                    "online": online["adj_close"].reindex(common_dates),
+                }).dropna()
+                common = common[(common["local"] > 0) & (common["online"] > 0)]
             else:
-                logs.append(
-                    f"{name}: 新增 {result['new_rows']} 条，已基于复权因子重建前复权列 {result['adj_rows']} 条，复权因子 {result['factor_rows']} 条，最新日期 {result['new_max']}。"
-                )
-        except Exception as e:
-            logs.append(f"{name} 更新失败: {e}")
-        
-        progress_bar.progress((i + 1) / total_etfs)
-        time.sleep(0.1) # Be nice to API
-        
-    status_text.text("数据更新完成！")
-    with st.expander("查看更新日志"):
-        st.write(logs)
-    
-    return True
+                common = pd.DataFrame()
+
+            if not common.empty:
+                scale = float(common.iloc[-1]["local"] / common.iloc[-1]["online"])
+                online["adj_close"] = online["adj_close"] * scale
+                merged = local.copy()
+                if "_price_source" not in merged.columns:
+                    merged["_price_source"] = "Tushare 本地历史"
+                for date in online.index:
+                    local_valid = False
+                    if date in merged.index and {"close", "adj_close"}.issubset(merged.columns):
+                        raw_value = pd.to_numeric(pd.Series([merged.at[date, "close"]]), errors="coerce").iloc[0]
+                        adj_value = pd.to_numeric(pd.Series([merged.at[date, "adj_close"]]), errors="coerce").iloc[0]
+                        local_valid = pd.notna(raw_value) and pd.notna(adj_value) and raw_value > 0 and adj_value > 0
+                    if not local_valid:
+                        row = online.loc[date]
+                        for column in ("close", "adj_close"):
+                            if column not in merged.columns:
+                                merged[column] = np.nan
+                            merged.loc[date, column] = float(row[column])
+                        merged.loc[date, "_price_source"] = "东方财富日线补缺（复权尺度已对齐）"
+                source = "Tushare 本地历史 + 东方财富日线补缺"
+            else:
+                # 没有共同日时不混合未知复权基准，改用东方财富完整窗口独立计算。
+                merged = online.copy()
+                merged["_price_source"] = "东方财富日线（完整窗口）"
+                source = "东方财富日线（完整窗口）"
+
+            merged = merged.sort_index()
+            merged = merged.loc[merged.index <= end_ts]
+            valid = (
+                pd.to_numeric(merged.get("close"), errors="coerce").gt(0)
+                & pd.to_numeric(merged.get("adj_close"), errors="coerce").gt(0)
+            )
+            merged = merged.loc[valid]
+            if required_dates:
+                missing_online = [
+                    date for date in required_dates
+                    if pd.to_datetime(date, format="%Y%m%d") not in merged.index
+                ]
+                if missing_online:
+                    raise ValueError("东方财富补数后仍缺少交易日 " + ", ".join(missing_online))
+            if len(merged) < window:
+                raise ValueError(f"有效历史仅 {len(merged)} 个交易日，少于所需 {window} 日")
+            history_data[name] = merged
+            history_sources[name] = source
+        except Exception as exc:
+            errors.append(f"{name}（{code}）：东方财富历史补数失败：{exc}")
+
+    return history_data, history_sources, errors
 
 def get_tushare_token():
     """
@@ -364,11 +523,12 @@ def precalculate_all_scores(history_data, window=20):
     return all_scores
 
 
-def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, params, official_scores=None):
+def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, params, official_scores=None, history_sources=None):
     """用当天未复权实时价替换模拟收盘价，再按策略动量公式重算分数和排名。"""
     rows = []
     calculation_details = {}
     official_scores = official_scores if official_scores is not None else pd.DataFrame()
+    history_sources = history_sources or {}
 
     for asset in assets:
         name = str(asset.get("name", "")).strip()
@@ -381,6 +541,7 @@ def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, pa
         if quote is None:
             rows.append({"标的": name, "代码": code, "报价来源": "未取得有效报价"})
             continue
+        history_source = history_sources.get(name, "Tushare 本地历史")
         if "close" not in history.columns:
             rows.append({"标的": name, "代码": code, "报价来源": "历史数据缺少收盘价"})
             continue
@@ -439,6 +600,11 @@ def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, pa
             raw_model_prices.loc[quote_day] = float(quote.price)
             calculation_details[name] = pd.DataFrame({
                 "日期": [pd.Timestamp(date).strftime("%Y-%m-%d") for date in model_dates],
+                "历史数据来源": [
+                    ("实时报价：" + quote.source) if pd.Timestamp(date) == quote_day
+                    else str(history.get("_price_source", pd.Series(index=history.index, dtype=object)).get(date, history_source))
+                    for date in model_dates
+                ],
                 "原始收盘价/盘中报价": raw_model_prices.to_numpy(),
                 "模型复权价格": model_window.to_numpy(),
                 "对数价格 ln(P)": log_prices,
@@ -476,11 +642,12 @@ def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, pa
             "标的": name,
             "代码": code,
             "模拟排名": np.nan,
-            "正式收盘得分": official_score,
-            "正式得分日期": official_score_date,
+            "前一完整交易日收盘得分": official_score,
+            "前一完整交易日": official_score_date,
             "盘中预估得分": float(simulated_score) if not pd.isna(simulated_score) else np.nan,
             "历史数据截至": pd.Timestamp(history_as_of).strftime("%Y-%m-%d"),
             "模拟报价日期": quote_day.strftime("%Y-%m-%d"),
+            "历史数据来源": history_source,
             "换算比例": adjustment_ratio,
             "未复权报价": float(quote.price),
             "模拟复权价": simulated_adjusted_close,
@@ -1149,11 +1316,11 @@ def get_strategy_params():
             if not ts_token:
                 st.error("未配置 Tushare Token，无法更新数据。")
                 st.stop()
-            if update_data(ts_token, force=force_update):
+            update_ok = update_data(ts_token, force=force_update)
+            load_history_data.clear()
+            precalculate_all_scores.clear()
+            if update_ok:
                 st.success("数据更新成功！请刷新页面或重新回测。")
-                # Clear cache to force reload
-                load_history_data.clear()
-                precalculate_all_scores.clear()
                 st.rerun()
     
     st.sidebar.divider()
@@ -1207,7 +1374,10 @@ def get_strategy_params():
             st.error(err)
             st.stop()
         with st.spinner("正在下载新增标的历史数据..."):
-            if not update_data(ts_token, force=True, assets=[item]):
+            update_ok = update_data(ts_token, force=True, assets=[item])
+            load_history_data.clear()
+            precalculate_all_scores.clear()
+            if not update_ok:
                 st.error("新增标的下载失败")
                 st.stop()
         codes = load_active_pool_codes()
@@ -1367,17 +1537,29 @@ def render_latest_holding_page(auto_refresh=False):
         st.session_state.pop("intraday_momentum_snapshot", None)
         ts_token = get_tushare_token()
         if not ts_token:
-            st.error("未配置 Tushare Token，无法更新数据与计算最新信号。请在侧边栏输入 Token 或在 Streamlit Cloud Secrets 配置 TUSHARE_TOKEN。")
+            update_data(
+                ts_token,
+                required_window=int(params.get("window", 25)),
+            )
         else:
             with st.spinner("正在同步最新市场数据..."):
-                # 最新信号沿用增量更新，不重复下载全部历史行情。
-                update_ok = update_data(ts_token, force=False)
+                # 信号只使用最近一个完整交易日及之前的完整历史窗口。
+                update_ok = update_data(
+                    ts_token,
+                    force=False,
+                    required_window=int(params.get("window", 25)),
+                )
+            load_history_data.clear()
+            precalculate_all_scores.clear()
             if update_ok:
-                load_history_data.clear()
-                precalculate_all_scores.clear()
-
                 with st.spinner("正在计算策略信号..."):
                     history_data = load_history_data()
+                    target_date = st.session_state["market_data_sync_report"]["target_date"]
+                    cutoff = pd.to_datetime(target_date, format="%Y%m%d")
+                    history_data = {
+                        name: frame.loc[frame.index <= cutoff].copy()
+                        for name, frame in history_data.items()
+                    }
                     scores_df = precalculate_all_scores(history_data, window=params['window'])
                     rsrs_df = precalculate_all_rsrs(history_data)
 
@@ -1402,6 +1584,14 @@ def render_latest_holding_page(auto_refresh=False):
                 st.error("数据更新失败，无法获取最新信号。")
 
     result = st.session_state.get('latest_holding_result')
+    sync_report = st.session_state.get("market_data_sync_report")
+    if result and sync_report and not sync_report.get("ready"):
+        refreshed_at = result.get("refreshed_at")
+        refreshed_label = refreshed_at.strftime("%Y-%m-%d %H:%M:%S") if refreshed_at is not None else "未知时间"
+        st.warning(
+            f"本次行情同步或完整性校验未通过。当前页面保留上次成功计算的信号（{refreshed_label}）；"
+            "盘中模拟会在历史窗口校验通过前停止计算。"
+        )
     if not result:
         st.info("进入本页后会自动同步数据并计算最新信号；如果自动更新失败，可检查 Token 后点击上方按钮重试。")
     else:
@@ -1489,39 +1679,80 @@ def render_latest_holding_page(auto_refresh=False):
     st.divider()
     st.subheader("💹 模拟收盘价（盘中预估）")
     st.caption(
-        "点击后按腾讯→新浪→东方财富顺序获取各标的当天未复权报价，再用最近历史记录的复权比例换算并重算动量排名。"
+        "点击后先重试 Tushare 更新历史行情；若动量窗口仍有缺口，再用东方财富日线临时补齐。随后按腾讯→新浪→东方财富顺序获取当天未复权报价，并重算动量排名。"
         "结果仅为盘中估算；调整策略参数后请重新计算。"
     )
     simulate_clicked = st.button("💹 获取盘中报价并重算排名", key="simulate_intraday_close")
     if simulate_clicked:
         assets = get_selected_assets_config()
-        with st.spinner("正在获取免费行情并计算盘中预估排名..."):
+        with st.spinner("正在重试 Tushare 历史更新..."):
+            ts_token = get_tushare_token()
+            update_data(
+                ts_token,
+                force=False,
+                assets=assets,
+                required_window=int(params.get("window", 25)),
+                allow_online_fallback=True,
+            )
+            load_history_data.clear()
+            precalculate_all_scores.clear()
+        with st.spinner("正在获取盘中报价并准备历史窗口..."):
             quotes, quote_errors = fetch_intraday_quotes(assets)
             if quotes:
-                simulation_history = load_history_data()
-                simulation_scores = precalculate_all_scores(
-                    simulation_history,
-                    window=int(params.get("window", 25)),
-                )
-                ranking, calculation_details = calculate_intraday_momentum_ranking(
-                    history_data=simulation_history,
+                quote_day = next(iter(quotes.values())).timestamp.date()
+                quote_day_key = quote_day.strftime("%Y%m%d")
+                sync_report = st.session_state.get("market_data_sync_report") or {}
+                simulation_history, history_sources, history_errors = prepare_simulation_history(
                     assets=assets,
-                    quotes=quotes,
+                    quote_day=quote_day,
                     window=int(params.get("window", 25)),
-                    params=params,
-                    official_scores=simulation_scores,
+                    sync_report=sync_report,
                 )
-                st.session_state["intraday_momentum_snapshot"] = {
-                    "ranking": ranking,
-                    "calculation_details": calculation_details,
-                    "quote_count": len(quotes),
-                    "calculated_at": pd.Timestamp.now(ZoneInfo("Asia/Shanghai")),
-                    "errors": quote_errors,
-                }
+                if not history_errors:
+                    simulation_scores = precalculate_all_scores(
+                        simulation_history,
+                        window=int(params.get("window", 25)),
+                    )
+                    ranking, calculation_details = calculate_intraday_momentum_ranking(
+                        history_data=simulation_history,
+                        assets=assets,
+                        quotes=quotes,
+                        window=int(params.get("window", 25)),
+                        params=params,
+                        official_scores=simulation_scores,
+                        history_sources=history_sources,
+                    )
+                    st.session_state["intraday_momentum_snapshot"] = {
+                        "history_ready": True,
+                        "ranking": ranking,
+                        "calculation_details": calculation_details,
+                        "history_sources": history_sources,
+                        "history_fallback_errors": [],
+                        "quote_count": len(quotes),
+                        "calculated_at": pd.Timestamp.now(ZoneInfo("Asia/Shanghai")),
+                        "errors": quote_errors,
+                    }
+                else:
+                    history_failures = history_errors
+                    st.session_state["intraday_momentum_snapshot"] = {
+                        "history_ready": False,
+                        "history_error": "；".join(history_failures),
+                        "ranking": pd.DataFrame(),
+                        "calculation_details": {},
+                        "history_sources": history_sources,
+                        "history_fallback_errors": history_errors,
+                        "quote_count": len(quotes),
+                        "calculated_at": pd.Timestamp.now(ZoneInfo("Asia/Shanghai")),
+                        "errors": quote_errors,
+                    }
             else:
                 st.session_state["intraday_momentum_snapshot"] = {
+                    "history_ready": False,
+                    "history_error": "没有取得任何标的的当天有效盘中报价",
                     "ranking": pd.DataFrame(),
                     "calculation_details": {},
+                    "history_sources": {},
+                    "history_fallback_errors": [],
                     "quote_count": 0,
                     "calculated_at": pd.Timestamp.now(ZoneInfo("Asia/Shanghai")),
                     "errors": quote_errors,
@@ -1531,13 +1762,26 @@ def render_latest_holding_page(auto_refresh=False):
     if intraday_snapshot:
         updated_at = intraday_snapshot["calculated_at"].strftime("%Y-%m-%d %H:%M:%S")
         if intraday_snapshot["quote_count"]:
-            st.success(f"已取得 {intraday_snapshot['quote_count']} 个标的的当天报价，计算时间：{updated_at}")
-            ranking = intraday_snapshot["ranking"]
-            st.dataframe(ranking, use_container_width=True, hide_index=True)
-            detail_options = [
-                name for name in ranking["标的"].dropna().astype(str).tolist()
-                if not intraday_snapshot.get("calculation_details", {}).get(name, pd.DataFrame()).empty
-            ]
+            if intraday_snapshot.get("history_ready"):
+                used_sources = sorted(set(intraday_snapshot.get("history_sources", {}).values()))
+                st.success(
+                    f"已取得 {intraday_snapshot['quote_count']} 个标的的当天报价，历史窗口可用，计算时间：{updated_at}。"
+                    f"历史来源：{'；'.join(used_sources) or '未知'}。"
+                )
+                ranking = intraday_snapshot["ranking"]
+                st.dataframe(ranking, use_container_width=True, hide_index=True)
+            else:
+                st.error(
+                    f"已取得当天报价，但历史行情未通过完整性校验，未生成模拟分数。"
+                    f"原因：{intraday_snapshot.get('history_error', '历史数据不完整')}"
+                )
+                ranking = pd.DataFrame()
+            detail_options = []
+            if intraday_snapshot.get("history_ready"):
+                detail_options = [
+                    name for name in ranking["标的"].dropna().astype(str).tolist()
+                    if not intraday_snapshot.get("calculation_details", {}).get(name, pd.DataFrame()).empty
+                ]
             if detail_options:
                 selected_detail = st.selectbox(
                     "选择标的查看得分拆解",
@@ -1554,7 +1798,11 @@ def render_latest_holding_page(auto_refresh=False):
                     "因此也可直接核对 `年化趋势收益率% × 加权R² = 盘中预估得分`。"
                 )
                 metric_cols = st.columns(5)
-                metric_cols[0].metric("正式收盘得分", f"{selected_row['正式收盘得分']:.4f}" if pd.notna(selected_row["正式收盘得分"]) else "暂无")
+                metric_cols[0].metric(
+                    f"前一完整交易日收盘得分（{selected_row['前一完整交易日']}）",
+                    f"{selected_row['前一完整交易日收盘得分']:.4f}"
+                    if pd.notna(selected_row["前一完整交易日收盘得分"]) else "暂无",
+                )
                 metric_cols[1].metric("盘中预估得分", f"{calculated_score:.4f}")
                 metric_cols[2].metric("年化趋势收益率", f"{annualized_return:.2f}%")
                 metric_cols[3].metric("加权 R²", f"{r_squared:.6f}")
@@ -1569,7 +1817,7 @@ def render_latest_holding_page(auto_refresh=False):
                     f"盘中未复权报价 {float(selected_row['未复权报价']):.4f} × "
                     f"换算比例 {float(selected_row['换算比例']):.8f} = "
                     f"模拟复权价 {float(selected_row['模拟复权价']):.6f}；"
-                    f"正式得分日期 {selected_row['正式得分日期']}，历史数据截至 {selected_row['历史数据截至']}，"
+                    f"前一完整交易日 {selected_row['前一完整交易日']}，历史数据截至 {selected_row['历史数据截至']}，"
                     f"模拟报价日期 {selected_row['模拟报价日期']}；按 {int(params.get('window', 25))} 个观测点计算。"
                 )
                 with st.expander("查看逐日回归输入、拟合值与误差", expanded=True):
@@ -1584,9 +1832,10 @@ def render_latest_holding_page(auto_refresh=False):
                     )
         else:
             st.warning("未取得当天有效报价，请稍后重试；模拟排名未生成。")
-        if intraday_snapshot["errors"]:
-            with st.expander("查看报价源回退情况"):
-                st.write("；".join(intraday_snapshot["errors"]))
+        if intraday_snapshot.get("history_fallback_errors") or intraday_snapshot["errors"]:
+            with st.expander("查看历史补数与报价源情况"):
+                diagnostics = intraday_snapshot.get("history_fallback_errors", []) + intraday_snapshot["errors"]
+                st.write("；".join(diagnostics))
 
 def calculate_thermometer(df):
     """

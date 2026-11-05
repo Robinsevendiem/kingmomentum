@@ -70,7 +70,6 @@ def main():
     if not token:
         raise SystemExit("缺少环境变量 TUSHARE_TOKEN")
 
-    ts.set_token(token)
     pro = ts.pro_api(token)
     end_date = get_open_trade_end_date(pro)
 

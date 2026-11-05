@@ -12,6 +12,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
@@ -170,6 +172,62 @@ def _fetch_eastmoney(codes: list[str]) -> dict[str, IntradayQuote]:
         if quote:
             parsed[code] = quote
     return parsed
+
+
+def fetch_eastmoney_daily_history(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """取东方财富未复权及前复权日线，供 Tushare 历史缺口的临时计算兜底。"""
+    _, market, numeric_code = _exchange_symbol(ts_code)
+    secid = f"{market}.{numeric_code}"
+    base_params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "beg": str(start_date).replace("-", ""),
+        "end": str(end_date).replace("-", ""),
+        "lmt": "1000",
+        "ut": EASTMONEY_UT,
+    }
+
+    def fetch_close_series(adjustment_flag: str, column: str) -> pd.Series:
+        params = dict(base_params, fqt=adjustment_flag)
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?" + urlencode(params)
+        body = _request_text(url, "https://quote.eastmoney.com/")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise QuoteFetchError("日线接口返回内容不是有效 JSON") from exc
+        data = payload.get("data") or {}
+        if str(data.get("code", "")) != numeric_code:
+            raise QuoteFetchError("日线接口未返回请求的证券代码")
+        rows = data.get("klines") or []
+        values = []
+        for item in rows:
+            parts = str(item).split(",")
+            if len(parts) < 3:
+                continue
+            try:
+                price = float(parts[2])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(price) and price > 0:
+                values.append((parts[0], price))
+        if not values:
+            raise QuoteFetchError(f"{ts_code} 日线接口没有返回有效数据")
+        series = pd.Series(
+            {pd.Timestamp(day): price for day, price in values},
+            name=column,
+            dtype=float,
+        )
+        return series.sort_index()
+
+    raw_close = fetch_close_series("0", "close")
+    adjusted_close = fetch_close_series("1", "adj_close")
+    history = pd.concat([raw_close, adjusted_close], axis=1).dropna()
+    history = history[(history["close"] > 0) & (history["adj_close"] > 0)]
+    if history.empty:
+        raise QuoteFetchError(f"{ts_code} 未取得日期一致的未复权和前复权日线")
+    return history.sort_index()
 
 
 def fetch_intraday_quotes(assets: list[dict]) -> tuple[dict[str, IntradayQuote], list[str]]:

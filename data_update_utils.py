@@ -24,16 +24,33 @@ def normalize_trade_date_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_open_trade_end_date(pro) -> str:
+    """返回今天之前最近一个已结束的交易日；不能确认日历时明确失败。"""
     sh_now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    cal_end = sh_now.strftime("%Y%m%d")
-    cal_start = (sh_now - timedelta(days=60)).strftime("%Y%m%d")
+    cal_end = (sh_now.date() - timedelta(days=1)).strftime("%Y%m%d")
+    cal_start = (sh_now.date() - timedelta(days=90)).strftime("%Y%m%d")
+    open_dates = get_open_trade_dates(pro, cal_start, cal_end)
+    if not open_dates:
+        raise RuntimeError("Tushare 交易日历没有返回可用的已完成交易日")
+    return open_dates[-1]
+
+
+def get_open_trade_dates(pro, start_date: str, end_date: str) -> list[str]:
+    """读取日期范围内的开市日，接口失败或空响应时不伪造交易日。"""
+    if not start_date or not end_date or start_date > end_date:
+        return []
     try:
-        open_days = pro.trade_cal(exchange="", start_date=cal_start, end_date=cal_end, is_open="1")
-        if open_days is not None and not open_days.empty:
-            return str(open_days["cal_date"].max())
-    except Exception:
-        pass
-    return cal_end
+        calendar = pro.trade_cal(
+            exchange="",
+            start_date=start_date,
+            end_date=end_date,
+            is_open="1",
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Tushare 交易日历查询失败：{exc}") from exc
+    if calendar is None or calendar.empty or "cal_date" not in calendar.columns:
+        raise RuntimeError("Tushare 交易日历返回空数据，无法确认历史行情是否完整")
+    dates = normalize_trade_date(calendar["cal_date"]).dropna().unique().tolist()
+    return sorted(date for date in dates if start_date <= date <= end_date)
 
 
 def read_history_csv(file_path: str) -> pd.DataFrame:
@@ -43,7 +60,7 @@ def read_history_csv(file_path: str) -> pd.DataFrame:
     return normalize_trade_date_frame(df)
 
 
-def fetch_pro_bar_chunked(ts_code: str, start_date: str, end_date: str, asset: str, adj=None, chunk_days: int = 700) -> pd.DataFrame:
+def fetch_pro_bar_chunked(ts_code: str, start_date: str, end_date: str, asset: str, adj=None, chunk_days: int = 700, api=None) -> pd.DataFrame:
     if not start_date or not end_date or start_date > end_date:
         return pd.DataFrame()
 
@@ -60,7 +77,7 @@ def fetch_pro_bar_chunked(ts_code: str, start_date: str, end_date: str, asset: s
         last_err = None
         for attempt in range(3):
             try:
-                df = ts.pro_bar(ts_code=ts_code, start_date=s_date, end_date=e_date, adj=adj, asset=asset)
+                df = ts.pro_bar(ts_code=ts_code, api=api, start_date=s_date, end_date=e_date, adj=adj, asset=asset)
                 if df is not None and not df.empty:
                     all_data.append(df)
                 last_err = None
@@ -207,11 +224,11 @@ def rebuild_history_with_full_adjusted(existing_df: pd.DataFrame, raw_incrementa
     return final_df
 
 
-def update_history_file(file_path: str, ts_code: str, asset_type: str, start_date: str, end_date: str, force: bool = False, pro=None) -> dict:
+def update_history_file(file_path: str, ts_code: str, asset_type: str, start_date: str, end_date: str, force: bool = False, pro=None, repair_start_date: str | None = None) -> dict:
     existing_df = pd.DataFrame() if force else read_history_csv(file_path)
     old_max = existing_df["trade_date"].max() if not existing_df.empty and "trade_date" in existing_df.columns else ""
 
-    if not force and old_max and str(old_max) >= str(end_date):
+    if not force and old_max and str(old_max) >= str(end_date) and not repair_start_date:
         return {
             "file_path": file_path,
             "ts_code": ts_code,
@@ -219,12 +236,20 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
             "old_max": str(old_max),
             "new_max": str(old_max),
             "rows": int(len(existing_df)),
+            "new_rows": 0,
+            "adj_rows": 0,
+            "factor_rows": 0,
             "updated": False,
             "reason": "up_to_date",
+            "status": "up_to_date",
         }
 
     raw_start = start_date
-    if not force and old_max:
+    if force:
+        raw_start = start_date
+    elif repair_start_date:
+        raw_start = max(start_date, normalize_trade_date(pd.Series([repair_start_date])).iloc[0])
+    elif not force and old_max:
         raw_start = (datetime.strptime(old_max, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
 
     raw_incremental_df = pd.DataFrame()
@@ -235,6 +260,7 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
             end_date=end_date,
             asset=asset_type,
             adj=None,
+            api=pro,
         )
 
     raw_frames = []
