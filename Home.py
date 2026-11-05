@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from data_update_utils import get_open_trade_end_date, update_history_file
+from intraday_quotes import fetch_intraday_quotes
 
 warnings.filterwarnings('ignore')
 
@@ -361,6 +362,90 @@ def precalculate_all_scores(history_data, window=20):
         scores.name = asset
         all_scores = pd.merge(all_scores, scores, left_index=True, right_index=True, how='outer')
     return all_scores
+
+
+def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, params, official_scores=None):
+    """用当天未复权实时价替换模拟收盘价，再按策略动量公式重算分数和排名。"""
+    rows = []
+    official_scores = official_scores if official_scores is not None else pd.DataFrame()
+
+    for asset in assets:
+        name = str(asset.get("name", "")).strip()
+        code = str(asset.get("code", "")).strip()
+        quote = quotes.get(code)
+        history = history_data.get(name)
+        if history is None or history.empty:
+            rows.append({"标的": name, "代码": code, "报价来源": "无本地历史数据"})
+            continue
+        if quote is None:
+            rows.append({"标的": name, "代码": code, "报价来源": "未取得有效报价"})
+            continue
+        if "close" not in history.columns:
+            rows.append({"标的": name, "代码": code, "报价来源": "历史数据缺少收盘价"})
+            continue
+
+        raw_close = pd.to_numeric(history["close"], errors="coerce").dropna()
+        if raw_close.empty:
+            rows.append({"标的": name, "代码": code, "报价来源": "历史收盘价无效"})
+            continue
+
+        adjusted_column = "adj_close" if "adj_close" in history.columns else "close"
+        adjusted_close = pd.to_numeric(history[adjusted_column], errors="coerce").dropna()
+        common = pd.concat([raw_close.rename("raw"), adjusted_close.rename("adjusted")], axis=1).dropna()
+        if common.empty or common.iloc[-1]["raw"] <= 0:
+            adjustment_ratio = 1.0
+            last_raw_close = float(raw_close.iloc[-1])
+            last_adjusted_close = last_raw_close
+        else:
+            last_raw_close = float(common.iloc[-1]["raw"])
+            last_adjusted_close = float(common.iloc[-1]["adjusted"])
+            adjustment_ratio = last_adjusted_close / last_raw_close
+
+        # 以最近历史交易日的复权/未复权比例把实时未复权价映射到动量序列尺度。
+        simulated_adjusted_close = float(quote.price) * adjustment_ratio
+        score_series = adjusted_close.copy()
+        quote_day = pd.Timestamp(quote.timestamp.date())
+        score_series.loc[quote_day] = simulated_adjusted_close
+        score_series = score_series.sort_index()
+        score_series = score_series[~score_series.index.duplicated(keep="last")]
+        simulated_score = calculate_rolling_scores(score_series, window=window).iloc[-1]
+
+        official_score = np.nan
+        if name in official_scores.columns and not official_scores[name].dropna().empty:
+            official_score = float(official_scores[name].dropna().iloc[-1])
+
+        name_to_code = params.get("name_to_code", {}) or {}
+        asset_code = name_to_code.get(name, code)
+        cutoff = float(params.get("fallback_cutoff", 300))
+        if asset_code in (params.get("user_cutoffs", {}) or {}):
+            cutoff = float(params["user_cutoffs"][asset_code])
+        if pd.isna(simulated_score):
+            status = "数据不足"
+        elif simulated_score <= 0:
+            status = "📉 负动量"
+        elif simulated_score > cutoff:
+            status = f"🚫 过热 (>{cutoff:g})"
+        else:
+            status = "✅ 候选"
+
+        rows.append({
+            "标的": name,
+            "代码": code,
+            "模拟排名": np.nan,
+            "正式收盘得分": official_score,
+            "盘中预估得分": float(simulated_score) if not pd.isna(simulated_score) else np.nan,
+            "未复权报价": float(quote.price),
+            "模拟复权价": simulated_adjusted_close,
+            "报价来源": quote.source,
+            "报价时间": quote.timestamp.strftime("%H:%M:%S"),
+            "状态": status,
+        })
+
+    ranked_rows = [row for row in rows if pd.notna(row.get("盘中预估得分", np.nan))]
+    ranked_rows.sort(key=lambda row: row["盘中预估得分"], reverse=True)
+    for rank, row in enumerate(ranked_rows, start=1):
+        row["模拟排名"] = rank
+    return pd.DataFrame(rows)
 
 @st.cache_data
 def calculate_rsrs_score(df, N=18, M=600):
@@ -1226,133 +1311,178 @@ def render_latest_holding_page(auto_refresh=False):
 
     refresh_clicked = st.button("🔄 重新同步数据并计算最新信号", type="primary")
     if auto_refresh or refresh_clicked:
-        # 1. Update Data
+        st.session_state.pop("intraday_momentum_snapshot", None)
         ts_token = get_tushare_token()
         if not ts_token:
             st.error("未配置 Tushare Token，无法更新数据与计算最新信号。请在侧边栏输入 Token 或在 Streamlit Cloud Secrets 配置 TUSHARE_TOKEN。")
-            return
-        
-        with st.spinner("正在同步最新市场数据..."):
-            # Default to incremental update for "Latest Holding" check
-            if not update_data(ts_token, force=False):
+        else:
+            with st.spinner("正在同步最新市场数据..."):
+                # 最新信号沿用增量更新，不重复下载全部历史行情。
+                update_ok = update_data(ts_token, force=False)
+            if update_ok:
+                load_history_data.clear()
+                precalculate_all_scores.clear()
+
+                with st.spinner("正在计算策略信号..."):
+                    history_data = load_history_data()
+                    scores_df = precalculate_all_scores(history_data, window=params['window'])
+                    rsrs_df = precalculate_all_rsrs(history_data)
+
+                    backtest_params = params.copy()
+                    backtest_params['end_date'] = pd.Timestamp.now()
+
+                    df_res, df_trades, timeline, last_signal = run_backtest(history_data, scores_df, backtest_params)
+
+                    if timeline:
+                        # 将结果与本次使用的参数一起保存，避免控件重跑时重复请求行情。
+                        st.session_state['latest_holding_result'] = {
+                            'last_dt': timeline[-1],
+                            'last_signal': last_signal,
+                            'scores_df': scores_df,
+                            'rsrs_df': rsrs_df,
+                            'params': params,
+                            'refreshed_at': pd.Timestamp.now(),
+                        }
+                    else:
+                        st.error("无法计算信号，请检查数据或日期范围。")
+            else:
                 st.error("数据更新失败，无法获取最新信号。")
-                return
-            load_history_data.clear()
-            precalculate_all_scores.clear()
-            
-        # 2. Load & Calc
-        with st.spinner("正在计算策略信号..."):
-            history_data = load_history_data()
-            scores_df = precalculate_all_scores(history_data, window=params['window'])
-            rsrs_df = precalculate_all_rsrs(history_data)
-            
-            # 3. Run Backtest to determine state
-            # We run from a reasonable past date to ensure state is correct
-            # Start from 2024-01-01 or params['start_date']? 
-            # Use params['start_date'] to be consistent with backtest settings
-            backtest_params = params.copy()
-            backtest_params['end_date'] = pd.Timestamp.now() # Ensure we go up to today
-            
-            df_res, df_trades, timeline, last_signal = run_backtest(history_data, scores_df, backtest_params)
-            
-            if not timeline:
-                st.error("无法计算信号，请检查数据或日期范围。")
-                return
-            # 将结果与本次使用的参数一起保存，避免 Streamlit 控件重跑时重复请求行情。
-            st.session_state['latest_holding_result'] = {
-                'last_dt': timeline[-1],
-                'last_signal': last_signal,
-                'scores_df': scores_df,
-                'rsrs_df': rsrs_df,
-                'params': params,
-                'refreshed_at': pd.Timestamp.now(),
-            }
 
     result = st.session_state.get('latest_holding_result')
     if not result:
         st.info("进入本页后会自动同步数据并计算最新信号；如果自动更新失败，可检查 Token 后点击上方按钮重试。")
-        return
+    else:
+        # 4. Display the most recently calculated result.
+        last_dt = result['last_dt']
+        last_signal = result['last_signal']
+        scores_df = result['scores_df']
+        rsrs_df = result['rsrs_df']
+        result_params = result['params']
+        latest_date = last_dt.strftime('%Y-%m-%d')
+        next_holding = last_signal.get('next_holding', '现金')
+        next_score = last_signal.get('score', 0)
+        next_holdings = last_signal.get('next_holdings', [])
+        next_scores = last_signal.get('scores', {})
 
-    # 4. Display the most recently calculated result.
-    last_dt = result['last_dt']
-    last_signal = result['last_signal']
-    scores_df = result['scores_df']
-    rsrs_df = result['rsrs_df']
-    result_params = result['params']
-    latest_date = last_dt.strftime('%Y-%m-%d')
-    next_holding = last_signal.get('next_holding', '现金')
-    next_score = last_signal.get('score', 0)
-    next_holdings = last_signal.get('next_holdings', [])
-    next_scores = last_signal.get('scores', {})
+        refreshed_at = result.get('refreshed_at')
+        if refreshed_at is not None:
+            st.caption(
+                f"最近同步：{refreshed_at.strftime('%Y-%m-%d %H:%M:%S')}；结果按此次同步时的策略参数计算。"
+                "调整参数后，请点击上方按钮重新同步并计算。"
+            )
 
-    refreshed_at = result.get('refreshed_at')
-    if refreshed_at is not None:
-        st.caption(
-            f"最近同步：{refreshed_at.strftime('%Y-%m-%d %H:%M:%S')}；结果按此次同步时的策略参数计算。"
-            "调整参数后，请点击上方按钮重新同步并计算。"
-        )
+        st.divider()
+        st.markdown(f"### 📅 数据日期: {latest_date}")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### 建议持仓 (T+1)")
+            if next_holding == '现金':
+                st.warning(f"### 💵 {next_holding}")
+            else:
+                st.success(f"### 🚀 {next_holding}")
+
+        with col2:
+            if next_holdings:
+                st.markdown("#### 动量得分")
+                st.write(" | ".join([f"{a}: {float(next_scores.get(a, 0)):.1f}" for a in next_holdings]))
+            else:
+                st.markdown("#### 动量得分")
+                st.metric("Score", f"{float(next_score):.1f}")
+
+        st.divider()
+        st.markdown("#### 📊 当日标的得分详情")
+
+        if last_dt in scores_df.index:
+            today_scores = scores_df.loc[last_dt].dropna().sort_values(ascending=False)
+            details = []
+            for asset, score in today_scores.items():
+                name_to_code_disp = result_params.get("name_to_code", {}) or {}
+                asset_code = name_to_code_disp.get(asset)
+                cutoff_val = float(result_params.get("fallback_cutoff", 300))
+                if asset_code and 'user_cutoffs' in result_params and asset_code in result_params['user_cutoffs']:
+                    cutoff_val = float(result_params['user_cutoffs'][asset_code])
+
+                status = "✅ 候选"
+                if score > cutoff_val:
+                    status = f"🚫 过热 (>{cutoff_val})"
+                elif score <= 0:
+                    status = "📉 负动量"
+
+                rsrs_val = np.nan
+                if last_dt in rsrs_df.index and asset in rsrs_df.columns:
+                    rsrs_val = rsrs_df.loc[last_dt, asset]
+                rsrs_str = f"{rsrs_val:.2f}" if not np.isnan(rsrs_val) else "-"
+
+                rsrs_status = ""
+                if not np.isnan(rsrs_val):
+                    if rsrs_val > 0.7:
+                        rsrs_status = "🔥 强势"
+                    elif rsrs_val < -0.7:
+                        rsrs_status = "🧊 弱势"
+                    else:
+                        rsrs_status = "↔️ 震荡"
+
+                details.append({
+                    '标的': asset,
+                    '动量得分': f"{score:.1f}",
+                    'RSRS指标': f"{rsrs_str} {rsrs_status}",
+                    '熔断阈值': cutoff_val,
+                    '状态': status
+                })
+
+            st.dataframe(pd.DataFrame(details))
 
     st.divider()
-    st.markdown(f"### 📅 数据日期: {latest_date}")
+    st.subheader("💹 模拟收盘价（盘中预估）")
+    st.caption(
+        "点击后按腾讯→新浪→东方财富顺序获取各标的当天未复权报价，再用最近历史记录的复权比例换算并重算动量排名。"
+        "结果仅为盘中估算；调整策略参数后请重新计算。"
+    )
+    simulate_clicked = st.button("💹 获取盘中报价并重算排名", key="simulate_intraday_close")
+    if simulate_clicked:
+        assets = get_selected_assets_config()
+        with st.spinner("正在获取免费行情并计算盘中预估排名..."):
+            quotes, quote_errors = fetch_intraday_quotes(assets)
+            if quotes:
+                simulation_history = load_history_data()
+                simulation_scores = precalculate_all_scores(
+                    simulation_history,
+                    window=int(params.get("window", 25)),
+                )
+                ranking = calculate_intraday_momentum_ranking(
+                    history_data=simulation_history,
+                    assets=assets,
+                    quotes=quotes,
+                    window=int(params.get("window", 25)),
+                    params=params,
+                    official_scores=simulation_scores,
+                )
+                st.session_state["intraday_momentum_snapshot"] = {
+                    "ranking": ranking,
+                    "quote_count": len(quotes),
+                    "calculated_at": pd.Timestamp.now(ZoneInfo("Asia/Shanghai")),
+                    "errors": quote_errors,
+                }
+            else:
+                st.session_state["intraday_momentum_snapshot"] = {
+                    "ranking": pd.DataFrame(),
+                    "quote_count": 0,
+                    "calculated_at": pd.Timestamp.now(ZoneInfo("Asia/Shanghai")),
+                    "errors": quote_errors,
+                }
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("#### 建议持仓 (T+1)")
-        if next_holding == '现金':
-            st.warning(f"### 💵 {next_holding}")
+    intraday_snapshot = st.session_state.get("intraday_momentum_snapshot")
+    if intraday_snapshot:
+        updated_at = intraday_snapshot["calculated_at"].strftime("%Y-%m-%d %H:%M:%S")
+        if intraday_snapshot["quote_count"]:
+            st.success(f"已取得 {intraday_snapshot['quote_count']} 个标的的当天报价，计算时间：{updated_at}")
+            st.dataframe(intraday_snapshot["ranking"], use_container_width=True, hide_index=True)
         else:
-            st.success(f"### 🚀 {next_holding}")
-
-    with col2:
-        if next_holdings:
-            st.markdown("#### 动量得分")
-            st.write(" | ".join([f"{a}: {float(next_scores.get(a, 0)):.1f}" for a in next_holdings]))
-        else:
-            st.markdown("#### 动量得分")
-            st.metric("Score", f"{float(next_score):.1f}")
-
-    st.divider()
-    st.markdown("#### 📊 当日标的得分详情")
-
-    if last_dt in scores_df.index:
-        today_scores = scores_df.loc[last_dt].dropna().sort_values(ascending=False)
-        details = []
-        for asset, score in today_scores.items():
-            name_to_code_disp = result_params.get("name_to_code", {}) or {}
-            asset_code = name_to_code_disp.get(asset)
-            cutoff_val = float(result_params.get("fallback_cutoff", 300))
-            if asset_code and 'user_cutoffs' in result_params and asset_code in result_params['user_cutoffs']:
-                cutoff_val = float(result_params['user_cutoffs'][asset_code])
-
-            status = "✅ 候选"
-            if score > cutoff_val:
-                status = f"🚫 过热 (>{cutoff_val})"
-            elif score <= 0:
-                status = "📉 负动量"
-
-            rsrs_val = np.nan
-            if last_dt in rsrs_df.index and asset in rsrs_df.columns:
-                rsrs_val = rsrs_df.loc[last_dt, asset]
-            rsrs_str = f"{rsrs_val:.2f}" if not np.isnan(rsrs_val) else "-"
-
-            rsrs_status = ""
-            if not np.isnan(rsrs_val):
-                if rsrs_val > 0.7:
-                    rsrs_status = "🔥 强势"
-                elif rsrs_val < -0.7:
-                    rsrs_status = "🧊 弱势"
-                else:
-                    rsrs_status = "↔️ 震荡"
-
-            details.append({
-                '标的': asset,
-                '动量得分': f"{score:.1f}",
-                'RSRS指标': f"{rsrs_str} {rsrs_status}",
-                '熔断阈值': cutoff_val,
-                '状态': status
-            })
-
-        st.dataframe(pd.DataFrame(details))
+            st.warning("未取得当天有效报价，请稍后重试；模拟排名未生成。")
+        if intraday_snapshot["errors"]:
+            with st.expander("查看报价源回退情况"):
+                st.write("；".join(intraday_snapshot["errors"]))
 
 def calculate_thermometer(df):
     """
