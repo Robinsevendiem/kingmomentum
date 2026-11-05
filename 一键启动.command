@@ -44,6 +44,8 @@ if ! "$PYTHON_BIN" -c "import streamlit" >/dev/null 2>&1; then
     fi
 fi
 
+PORT=$("$PYTHON_BIN" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+
 echo "正在启动 ETF 动量策略回测系统……"
-echo "本地地址：http://localhost:8501"
-exec "$PYTHON_BIN" -m streamlit run "$PROJECT_DIR/Home.py"
+echo "本地地址：http://127.0.0.1:${PORT}"
+exec "$PYTHON_BIN" -m streamlit run "$PROJECT_DIR/Home.py" --server.address 127.0.0.1 --server.port "$PORT"
