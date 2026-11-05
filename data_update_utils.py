@@ -23,10 +23,11 @@ def normalize_trade_date_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def get_open_trade_end_date(pro) -> str:
-    """返回今天之前最近一个已结束的交易日；不能确认日历时明确失败。"""
+def get_open_trade_end_date(pro, include_today: bool = False) -> str:
+    """返回最近开市日；默认只取昨天及以前，include_today 时允许返回今天。"""
     sh_now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    cal_end = (sh_now.date() - timedelta(days=1)).strftime("%Y%m%d")
+    cal_end_date = sh_now.date() if include_today else sh_now.date() - timedelta(days=1)
+    cal_end = cal_end_date.strftime("%Y%m%d")
     cal_start = (sh_now.date() - timedelta(days=90)).strftime("%Y%m%d")
     open_dates = get_open_trade_dates(pro, cal_start, cal_end)
     if not open_dates:
@@ -263,6 +264,14 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
             api=pro,
         )
 
+    downloaded_max = (
+        str(raw_incremental_df["trade_date"].max())
+        if raw_incremental_df is not None
+        and not raw_incremental_df.empty
+        and "trade_date" in raw_incremental_df.columns
+        else ""
+    )
+
     raw_frames = []
     if existing_df is not None and not existing_df.empty:
         existing_raw_cols = [c for c in existing_df.columns if not c.startswith("adj_")]
@@ -307,6 +316,7 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
                 "new_rows": 0,
                 "adj_rows": 0,
                 "factor_rows": 0,
+                "downloaded_max": downloaded_max,
                 "status": "no_new_data_factors_unavailable",
             }
 
@@ -330,6 +340,7 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
             "new_rows": 0,
             "adj_rows": 0,
             "factor_rows": 0,
+            "downloaded_max": downloaded_max,
             "status": "no_data",
         }
 
@@ -347,5 +358,6 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
         "new_rows": new_rows,
         "adj_rows": len(adjusted_full_df),
         "factor_rows": len(factor_df),
+        "downloaded_max": downloaded_max,
         "status": status,
     }

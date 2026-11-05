@@ -189,13 +189,14 @@ def add_custom_asset(token: str, ts_code: str):
 
 # --- Helper: Data Update ---
 def update_data(token, force=False, assets=None, required_window=25, allow_online_fallback=False):
-    """增量更新到最近完整交易日，并校验动量窗口覆盖后再报告可用。"""
+    """同步到最近可用开市日（含今日），并校验动量窗口覆盖。"""
     today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     if not token or not str(token).strip():
         report = {
             "ready": False,
             "as_of_date": today.strftime("%Y%m%d"),
             "target_date": None,
+            "is_current_day": False,
             "coverage": {},
             "failures": ["未配置 Tushare Token"],
             "warnings": [],
@@ -208,7 +209,8 @@ def update_data(token, force=False, assets=None, required_window=25, allow_onlin
     try:
         # pro_api(token) 直接在内存中使用凭据，不写入用户目录的 tk.csv。
         pro = ts.pro_api(token)
-        target_date = get_open_trade_end_date(pro)
+        # 最新持仓信号允许使用 Tushare 当日已返回的日线；非交易日则回退到最近开市日。
+        target_date = get_open_trade_end_date(pro, include_today=True)
         calendar_start = (
             pd.to_datetime(target_date, format="%Y%m%d") - pd.Timedelta(days=180)
         ).strftime("%Y%m%d")
@@ -218,8 +220,9 @@ def update_data(token, force=False, assets=None, required_window=25, allow_onlin
             "ready": False,
             "as_of_date": today.strftime("%Y%m%d"),
             "target_date": None,
+            "is_current_day": False,
             "coverage": {},
-            "failures": [f"无法确认最近完整交易日：{exc}"],
+            "failures": [f"无法确认最近开市日：{exc}"],
             "warnings": [],
         }
         st.session_state["market_data_sync_report"] = report
@@ -257,8 +260,13 @@ def update_data(token, force=False, assets=None, required_window=25, allow_onlin
 
         before_dates = valid_price_dates(before)
         missing_before = [date for date in applicable_dates if date not in before_dates]
-        repair_start_date = min(missing_before) if missing_before else None
+        # 当目标日是今天时，同时刷新最近两个开市日，避免前一日盘中记录留在 CSV 中不被收盘数据覆盖。
+        refresh_dates = window_dates[-2:] if target_date == today.strftime("%Y%m%d") else []
+        repair_candidates = missing_before + [date for date in refresh_dates if date >= start_date]
+        repair_start_date = min(repair_candidates) if repair_candidates else None
         update_error = None
+        downloaded_max = ""
+        update_status = ""
         try:
             result = update_history_file(
                 file_path=filename,
@@ -270,6 +278,8 @@ def update_data(token, force=False, assets=None, required_window=25, allow_onlin
                 pro=pro,
                 repair_start_date=repair_start_date,
             )
+            downloaded_max = str(result.get("downloaded_max", ""))
+            update_status = str(result.get("status", ""))
             logs.append(
                 f"{name}：状态 {result.get('status', result.get('reason', '未知'))}，"
                 f"最新日期 {result.get('new_max', '无')}，新增 {result.get('new_rows', 0)} 条。"
@@ -281,14 +291,21 @@ def update_data(token, force=False, assets=None, required_window=25, allow_onlin
         after_dates = valid_price_dates(after)
         missing_after = [date for date in applicable_dates if date not in after_dates]
         latest_date = max(after_dates) if after_dates else ""
+        current_bar_not_fresh = (
+            target_date == today.strftime("%Y%m%d")
+            and (downloaded_max < target_date or update_status not in {"ok", "adj_refreshed"})
+        )
         coverage[code] = {
             "name": name,
             "latest_date": latest_date,
             "required_dates": applicable_dates,
             "missing_dates": missing_after,
-            "needs_fallback": bool(latest_date < target_date or missing_after),
+            "needs_fallback": bool(latest_date < target_date or missing_after or current_bar_not_fresh),
+            "current_bar_fresh": not current_bar_not_fresh if target_date == today.strftime("%Y%m%d") else None,
         }
-        if latest_date < target_date or missing_after:
+        if current_bar_not_fresh:
+            failures.append(f"{name} ({code})：Tushare 本次未返回有效当日行情")
+        elif latest_date < target_date or missing_after:
             missing_text = f"缺少交易日 {', '.join(missing_after)}" if missing_after else f"最新日期落后于目标日 {target_date}"
             failures.append(f"{name} ({code})：{missing_text}")
             if update_error:
@@ -299,11 +316,50 @@ def update_data(token, force=False, assets=None, required_window=25, allow_onlin
         progress_bar.progress((i + 1) / max(1, len(target_assets)))
         time.sleep(0.1)
 
+    today_key = today.strftime("%Y%m%d")
+    if target_date == today_key and failures and len(expected_dates) > 1:
+        # 当日行情并非所有标的都已发布时，退回最近一个所有标的均覆盖的开市日。
+        fallback_target = expected_dates[-2]
+        fallback_window_dates = expected_dates[:-1][-max(1, int(required_window)):]
+        fallback_coverage = {}
+        fallback_failures = []
+        for asset in target_assets:
+            code = str(asset.get("code", "")).strip()
+            name = str(asset.get("name", "")).strip()
+            filename = str(asset.get("file_path", "")).strip() or f"data/{code}_{name}_history.csv"
+            start_date = str(asset.get("start_date", "")).strip() or "19900101"
+            frame = read_history_csv(filename)
+            valid_dates = valid_price_dates(frame)
+            applicable_dates = [date for date in fallback_window_dates if date >= start_date]
+            missing_dates = [date for date in applicable_dates if date not in valid_dates]
+            latest_date = max(valid_dates) if valid_dates else ""
+            fallback_coverage[code] = {
+                "name": name,
+                "latest_date": latest_date,
+                "required_dates": applicable_dates,
+                "missing_dates": missing_dates,
+                "needs_fallback": bool(latest_date < fallback_target or missing_dates),
+            }
+            if latest_date < fallback_target or missing_dates:
+                fallback_failures.append(
+                    f"{name} ({code})：回退日期 {fallback_target} 的窗口仍不完整"
+                )
+
+        if not fallback_failures:
+            warnings_list.append(
+                f"当日行情 {today_key} 尚未覆盖所有标的，已回退到最近完整数据日 {fallback_target}。"
+            )
+            target_date = fallback_target
+            window_dates = fallback_window_dates
+            coverage = fallback_coverage
+            failures = []
+
     ready = not failures
     report = {
         "ready": ready,
         "as_of_date": today.strftime("%Y%m%d"),
         "target_date": target_date,
+        "is_current_day": target_date == today.strftime("%Y%m%d"),
         "coverage": coverage,
         "failures": failures,
         "warnings": warnings_list,
@@ -313,12 +369,41 @@ def update_data(token, force=False, assets=None, required_window=25, allow_onlin
     with st.expander("查看行情更新与覆盖校验日志"):
         st.write(logs + warnings_list + failures)
     if ready:
-        st.success(f"本地行情已覆盖完整的 {required_window} 个观测窗口，基准收盘日：{target_date}。")
+        st.success(f"行情已覆盖完整的 {required_window} 个观测窗口，最新行情日：{target_date}。")
+        if warnings_list:
+            st.warning("；".join(warnings_list))
+        if target_date == today.strftime("%Y%m%d"):
+            st.info("当前信号使用 Tushare 已返回的今日收盘行情。")
     elif allow_online_fallback:
         st.warning(f"Tushare 历史校验未通过（目标日：{target_date}），盘中模拟将继续尝试东方财富在线日线补数。")
     else:
         st.error(f"历史行情未通过完整性校验，目标收盘日：{target_date}；暂不应据此计算信号或盘中分数。")
     return ready
+
+
+def calculate_latest_holding_snapshot(params, target_date):
+    """基于已同步的本地日线计算正式信号，不额外请求行情。"""
+    history_data = load_history_data()
+    cutoff = pd.to_datetime(target_date, format="%Y%m%d")
+    history_data = {
+        name: frame.loc[frame.index <= cutoff].copy()
+        for name, frame in history_data.items()
+    }
+    scores_df = precalculate_all_scores(history_data, window=params["window"])
+    rsrs_df = precalculate_all_rsrs(history_data)
+    backtest_params = params.copy()
+    backtest_params["end_date"] = pd.Timestamp.now()
+    _, _, timeline, last_signal = run_backtest(history_data, scores_df, backtest_params)
+    if not timeline:
+        return None
+    return {
+        "last_dt": timeline[-1],
+        "last_signal": last_signal,
+        "scores_df": scores_df,
+        "rsrs_df": rsrs_df,
+        "params": params,
+        "refreshed_at": pd.Timestamp.now(),
+    }
 
 
 def prepare_simulation_history(assets, quote_day, window, sync_report):
@@ -335,11 +420,15 @@ def prepare_simulation_history(assets, quote_day, window, sync_report):
     for asset in assets:
         name = str(asset.get("name", "")).strip()
         code = str(asset.get("code", "")).strip()
+        quote_day_ts = pd.Timestamp(quote_day)
         local = history_data.get(name, pd.DataFrame()).copy()
         if not local.empty:
-            local = local.loc[local.index < pd.Timestamp(quote_day)].copy()
+            local = local.loc[local.index < quote_day_ts].copy()
         asset_coverage = coverage.get(code, {})
-        required_dates = asset_coverage.get("required_dates", [])
+        required_dates = [
+            date for date in asset_coverage.get("required_dates", [])
+            if pd.to_datetime(date, format="%Y%m%d") < quote_day_ts
+        ]
         missing_dates = asset_coverage.get("missing_dates", [])
         needs_fallback = bool(asset_coverage.get("needs_fallback", not sync_report.get("ready")))
 
@@ -351,7 +440,7 @@ def prepare_simulation_history(assets, quote_day, window, sync_report):
 
         try:
             online = fetch_eastmoney_daily_history(code, start_date, end_date)
-            online = online.loc[online.index < pd.Timestamp(quote_day)].copy()
+            online = online.loc[online.index < quote_day_ts].copy()
             if online.empty:
                 raise ValueError("返回数据中没有报价日前的日线")
 
@@ -1543,7 +1632,7 @@ def render_latest_holding_page(auto_refresh=False):
             )
         else:
             with st.spinner("正在同步最新市场数据..."):
-                # 信号只使用最近一个完整交易日及之前的完整历史窗口。
+                # 使用 Tushare 最近可用开市日；若返回今天，则使用当天收盘行情。
                 update_ok = update_data(
                     ts_token,
                     force=False,
@@ -1553,31 +1642,11 @@ def render_latest_holding_page(auto_refresh=False):
             precalculate_all_scores.clear()
             if update_ok:
                 with st.spinner("正在计算策略信号..."):
-                    history_data = load_history_data()
                     target_date = st.session_state["market_data_sync_report"]["target_date"]
-                    cutoff = pd.to_datetime(target_date, format="%Y%m%d")
-                    history_data = {
-                        name: frame.loc[frame.index <= cutoff].copy()
-                        for name, frame in history_data.items()
-                    }
-                    scores_df = precalculate_all_scores(history_data, window=params['window'])
-                    rsrs_df = precalculate_all_rsrs(history_data)
-
-                    backtest_params = params.copy()
-                    backtest_params['end_date'] = pd.Timestamp.now()
-
-                    df_res, df_trades, timeline, last_signal = run_backtest(history_data, scores_df, backtest_params)
-
-                    if timeline:
+                    latest_snapshot = calculate_latest_holding_snapshot(params, target_date)
+                    if latest_snapshot:
                         # 将结果与本次使用的参数一起保存，避免控件重跑时重复请求行情。
-                        st.session_state['latest_holding_result'] = {
-                            'last_dt': timeline[-1],
-                            'last_signal': last_signal,
-                            'scores_df': scores_df,
-                            'rsrs_df': rsrs_df,
-                            'params': params,
-                            'refreshed_at': pd.Timestamp.now(),
-                        }
+                        st.session_state['latest_holding_result'] = latest_snapshot
                     else:
                         st.error("无法计算信号，请检查数据或日期范围。")
             else:
@@ -1616,6 +1685,8 @@ def render_latest_holding_page(auto_refresh=False):
 
         st.divider()
         st.markdown(f"### 📅 数据日期: {latest_date}")
+        if latest_date == datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d"):
+            st.info("当前信号已使用 Tushare 返回的今日收盘行情。")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -1678,11 +1749,29 @@ def render_latest_holding_page(auto_refresh=False):
 
     st.divider()
     st.subheader("💹 模拟收盘价（盘中预估）")
-    st.caption(
-        "点击后先重试 Tushare 更新历史行情；若动量窗口仍有缺口，再用东方财富日线临时补齐。随后按腾讯→新浪→东方财富顺序获取当天未复权报价，并重算动量排名。"
-        "结果仅为盘中估算；调整策略参数后请重新计算。"
+    sync_report = st.session_state.get("market_data_sync_report") or {}
+    today_key = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+    today_close_data_available = (
+        sync_report.get("ready")
+        and str(sync_report.get("target_date", "")) == today_key
     )
-    simulate_clicked = st.button("💹 获取盘中报价并重算排名", key="simulate_intraday_close")
+    st.caption(
+        "若今日收盘行情尚未通过 Tushare 同步，点击后先尝试更新历史行情；如果更新取得今日收盘数据，就直接计算正式信号并跳过实时报价。"
+        "只有尚未取得今日收盘行情时，才按腾讯→新浪→东方财富获取当天未复权报价并重算盘中排名。"
+        "今日数据已同步时，无需再请求实时报价；如需按调整后的策略参数重算正式信号，请使用上方同步按钮。"
+    )
+    simulate_button_label = (
+        "✅ 今日收盘数据已同步，无需盘中模拟"
+        if today_close_data_available
+        else "💹 获取盘中报价并重算排名"
+    )
+    simulate_clicked = st.button(
+        simulate_button_label,
+        key="simulate_intraday_close",
+        disabled=today_close_data_available,
+    )
+    if today_close_data_available:
+        st.caption("已取得今日 Tushare 收盘数据；如需刷新正式信号或应用新参数，请点击上方“重新同步数据并计算最新信号”。")
     if simulate_clicked:
         assets = get_selected_assets_config()
         with st.spinner("正在重试 Tushare 历史更新..."):
@@ -1696,6 +1785,19 @@ def render_latest_holding_page(auto_refresh=False):
             )
             load_history_data.clear()
             precalculate_all_scores.clear()
+        sync_report = st.session_state.get("market_data_sync_report") or {}
+        if (
+            sync_report.get("ready")
+            and str(sync_report.get("target_date", "")) == today_key
+        ):
+            with st.spinner("已取得今日收盘行情，正在计算正式收盘信号..."):
+                latest_snapshot = calculate_latest_holding_snapshot(params, today_key)
+            if latest_snapshot:
+                st.session_state["latest_holding_result"] = latest_snapshot
+                st.session_state.pop("intraday_momentum_snapshot", None)
+                st.rerun()
+            st.error("今日 Tushare 收盘行情已取得，但正式信号计算失败；已跳过不必要的盘中报价请求。")
+            st.stop()
         with st.spinner("正在获取盘中报价并准备历史窗口..."):
             quotes, quote_errors = fetch_intraday_quotes(assets)
             if quotes:
