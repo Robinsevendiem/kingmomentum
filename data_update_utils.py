@@ -262,6 +262,28 @@ def update_history_file(file_path: str, ts_code: str, asset_type: str, start_dat
             asset_type=asset_type,
         )
 
+    # 因子接口空结果可能来自服务或权限问题，不能默认为复权因子恒等于 1。
+    if asset_type in {"FD", "E"} and factor_df.empty:
+        has_existing_adjusted_prices = any(
+            f"adj_{col}" in existing_df.columns for col in PRICE_COLUMNS
+        )
+        if not raw_incremental_df.empty:
+            raise RuntimeError(
+                f"{ts_code}: 已获取新增行情，但没有取得复权因子；为避免覆盖复权历史，取消写入。"
+            )
+        if has_existing_adjusted_prices:
+            return {
+                "file_path": file_path,
+                "ts_code": ts_code,
+                "asset_type": asset_type,
+                "old_max": old_max,
+                "new_max": old_max,
+                "new_rows": 0,
+                "adj_rows": 0,
+                "factor_rows": 0,
+                "status": "no_new_data_factors_unavailable",
+            }
+
     if not raw_full_df.empty:
         adjusted_full_df = build_forward_adjusted_from_factor(raw_df=raw_full_df, factor_df=factor_df)
     else:

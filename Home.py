@@ -367,6 +367,7 @@ def precalculate_all_scores(history_data, window=20):
 def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, params, official_scores=None):
     """用当天未复权实时价替换模拟收盘价，再按策略动量公式重算分数和排名。"""
     rows = []
+    calculation_details = {}
     official_scores = official_scores if official_scores is not None else pd.DataFrame()
 
     for asset in assets:
@@ -392,6 +393,7 @@ def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, pa
         adjusted_column = "adj_close" if "adj_close" in history.columns else "close"
         adjusted_close = pd.to_numeric(history[adjusted_column], errors="coerce").dropna()
         common = pd.concat([raw_close.rename("raw"), adjusted_close.rename("adjusted")], axis=1).dropna()
+        history_as_of = common.index[-1] if not common.empty else raw_close.index[-1]
         if common.empty or common.iloc[-1]["raw"] <= 0:
             adjustment_ratio = 1.0
             last_raw_close = float(raw_close.iloc[-1])
@@ -410,9 +412,51 @@ def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, pa
         score_series = score_series[~score_series.index.duplicated(keep="last")]
         simulated_score = calculate_rolling_scores(score_series, window=window).iloc[-1]
 
+        # 复现正式打分的最后一个窗口，提供逐项可核对的回归输入和中间结果。
+        model_window = score_series.tail(window).astype(float)
+        slope = np.nan
+        intercept = np.nan
+        r_squared = np.nan
+        annualized_return = np.nan
+        calculation_details[name] = pd.DataFrame()
+        if len(model_window) == window and (model_window > 0).all():
+            x = np.arange(window)
+            x_norm = np.linspace(0, 1, window)
+            weights = 1 + x_norm ** 2
+            log_prices = np.log(model_window.to_numpy())
+            coeffs = np.polyfit(x, log_prices, 1, w=weights)
+            slope = float(coeffs[0])
+            intercept = float(coeffs[1])
+            fitted_log_prices = np.polyval(coeffs, x)
+            residuals = log_prices - fitted_log_prices
+            weighted_sse = float(np.sum(weights * residuals ** 2))
+            weighted_mean = float(np.average(log_prices, weights=weights))
+            weighted_sst = float(np.sum(weights * (log_prices - weighted_mean) ** 2))
+            r_squared = 0.0 if weighted_sst == 0 else 1 - weighted_sse / weighted_sst
+            annualized_return = float(np.exp(slope * 252) - 1)
+            model_dates = model_window.index
+            raw_model_prices = raw_close.reindex(model_dates).astype(float)
+            raw_model_prices.loc[quote_day] = float(quote.price)
+            calculation_details[name] = pd.DataFrame({
+                "日期": [pd.Timestamp(date).strftime("%Y-%m-%d") for date in model_dates],
+                "原始收盘价/盘中报价": raw_model_prices.to_numpy(),
+                "模型复权价格": model_window.to_numpy(),
+                "对数价格 ln(P)": log_prices,
+                "序号 x": x,
+                "回归权重 w": weights,
+                "加权对数均值": weighted_mean,
+                "拟合对数价格": fitted_log_prices,
+                "残差 ln(P)-拟合值": residuals,
+                "加权残差平方": weights * residuals ** 2,
+                "加权偏差平方": weights * (log_prices - weighted_mean) ** 2,
+            })
+
         official_score = np.nan
+        official_score_date = None
         if name in official_scores.columns and not official_scores[name].dropna().empty:
-            official_score = float(official_scores[name].dropna().iloc[-1])
+            official_series = official_scores[name].dropna()
+            official_score = float(official_series.iloc[-1])
+            official_score_date = pd.Timestamp(official_series.index[-1]).strftime("%Y-%m-%d")
 
         name_to_code = params.get("name_to_code", {}) or {}
         asset_code = name_to_code.get(name, code)
@@ -433,9 +477,17 @@ def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, pa
             "代码": code,
             "模拟排名": np.nan,
             "正式收盘得分": official_score,
+            "正式得分日期": official_score_date,
             "盘中预估得分": float(simulated_score) if not pd.isna(simulated_score) else np.nan,
+            "历史数据截至": pd.Timestamp(history_as_of).strftime("%Y-%m-%d"),
+            "模拟报价日期": quote_day.strftime("%Y-%m-%d"),
+            "换算比例": adjustment_ratio,
             "未复权报价": float(quote.price),
             "模拟复权价": simulated_adjusted_close,
+            "日斜率": slope,
+            "回归截距": intercept,
+            "年化趋势收益率%": annualized_return * 100 if pd.notna(annualized_return) else np.nan,
+            "加权R²": r_squared,
             "报价来源": quote.source,
             "报价时间": quote.timestamp.strftime("%H:%M:%S"),
             "状态": status,
@@ -445,7 +497,8 @@ def calculate_intraday_momentum_ranking(history_data, assets, quotes, window, pa
     ranked_rows.sort(key=lambda row: row["盘中预估得分"], reverse=True)
     for rank, row in enumerate(ranked_rows, start=1):
         row["模拟排名"] = rank
-    return pd.DataFrame(rows)
+    unranked_rows = [row for row in rows if pd.isna(row.get("盘中预估得分", np.nan))]
+    return pd.DataFrame(ranked_rows + unranked_rows), calculation_details
 
 @st.cache_data
 def calculate_rsrs_score(df, N=18, M=600):
@@ -1450,7 +1503,7 @@ def render_latest_holding_page(auto_refresh=False):
                     simulation_history,
                     window=int(params.get("window", 25)),
                 )
-                ranking = calculate_intraday_momentum_ranking(
+                ranking, calculation_details = calculate_intraday_momentum_ranking(
                     history_data=simulation_history,
                     assets=assets,
                     quotes=quotes,
@@ -1460,6 +1513,7 @@ def render_latest_holding_page(auto_refresh=False):
                 )
                 st.session_state["intraday_momentum_snapshot"] = {
                     "ranking": ranking,
+                    "calculation_details": calculation_details,
                     "quote_count": len(quotes),
                     "calculated_at": pd.Timestamp.now(ZoneInfo("Asia/Shanghai")),
                     "errors": quote_errors,
@@ -1467,6 +1521,7 @@ def render_latest_holding_page(auto_refresh=False):
             else:
                 st.session_state["intraday_momentum_snapshot"] = {
                     "ranking": pd.DataFrame(),
+                    "calculation_details": {},
                     "quote_count": 0,
                     "calculated_at": pd.Timestamp.now(ZoneInfo("Asia/Shanghai")),
                     "errors": quote_errors,
@@ -1477,7 +1532,56 @@ def render_latest_holding_page(auto_refresh=False):
         updated_at = intraday_snapshot["calculated_at"].strftime("%Y-%m-%d %H:%M:%S")
         if intraday_snapshot["quote_count"]:
             st.success(f"已取得 {intraday_snapshot['quote_count']} 个标的的当天报价，计算时间：{updated_at}")
-            st.dataframe(intraday_snapshot["ranking"], use_container_width=True, hide_index=True)
+            ranking = intraday_snapshot["ranking"]
+            st.dataframe(ranking, use_container_width=True, hide_index=True)
+            detail_options = [
+                name for name in ranking["标的"].dropna().astype(str).tolist()
+                if not intraday_snapshot.get("calculation_details", {}).get(name, pd.DataFrame()).empty
+            ]
+            if detail_options:
+                selected_detail = st.selectbox(
+                    "选择标的查看得分拆解",
+                    detail_options,
+                    key="intraday_score_detail_asset",
+                )
+                selected_row = ranking.loc[ranking["标的"].astype(str) == selected_detail].iloc[0]
+                annualized_return = float(selected_row["年化趋势收益率%"])
+                r_squared = float(selected_row["加权R²"])
+                calculated_score = float(selected_row["盘中预估得分"])
+                st.markdown(
+                    "**得分公式**：`(exp(日斜率 × 252) - 1) × 加权R² × 100`。"
+                    "页面中的“年化趋势收益率%”等于 `（exp(日斜率 × 252) - 1）× 100`，"
+                    "因此也可直接核对 `年化趋势收益率% × 加权R² = 盘中预估得分`。"
+                )
+                metric_cols = st.columns(5)
+                metric_cols[0].metric("正式收盘得分", f"{selected_row['正式收盘得分']:.4f}" if pd.notna(selected_row["正式收盘得分"]) else "暂无")
+                metric_cols[1].metric("盘中预估得分", f"{calculated_score:.4f}")
+                metric_cols[2].metric("年化趋势收益率", f"{annualized_return:.2f}%")
+                metric_cols[3].metric("加权 R²", f"{r_squared:.6f}")
+                metric_cols[4].metric("复权换算比例", f"{float(selected_row['换算比例']):.8f}")
+                selected_detail_table = intraday_snapshot["calculation_details"][selected_detail]
+                sum_cols = st.columns(4)
+                sum_cols[0].metric("回归日斜率", f"{float(selected_row['日斜率']):.8f}")
+                sum_cols[1].metric("加权 SSE", f"{selected_detail_table['加权残差平方'].sum():.8f}")
+                sum_cols[2].metric("加权 SST", f"{selected_detail_table['加权偏差平方'].sum():.8f}")
+                sum_cols[3].metric("回归截距", f"{float(selected_row['回归截距']):.8f}")
+                st.caption(
+                    f"盘中未复权报价 {float(selected_row['未复权报价']):.4f} × "
+                    f"换算比例 {float(selected_row['换算比例']):.8f} = "
+                    f"模拟复权价 {float(selected_row['模拟复权价']):.6f}；"
+                    f"正式得分日期 {selected_row['正式得分日期']}，历史数据截至 {selected_row['历史数据截至']}，"
+                    f"模拟报价日期 {selected_row['模拟报价日期']}；按 {int(params.get('window', 25))} 个观测点计算。"
+                )
+                with st.expander("查看逐日回归输入、拟合值与误差", expanded=True):
+                    st.caption(
+                        "权重从 1 递增到 2，最近观测点权重最大。拟合值和残差均在对数价格尺度；"
+                        "加权残差平方之和对应 SSE，可用于复核 R²。"
+                    )
+                    st.dataframe(
+                        selected_detail_table,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
         else:
             st.warning("未取得当天有效报价，请稍后重试；模拟排名未生成。")
         if intraday_snapshot["errors"]:

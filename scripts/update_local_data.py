@@ -78,7 +78,20 @@ def main():
     custom_meta_map = _load_custom_asset_meta()
     rows = []
     for file_path in files:
-        rows.append(_update_one(file_path=file_path, end_date=end_date, custom_meta_map=custom_meta_map, pro=pro))
+        try:
+            rows.append(_update_one(file_path=file_path, end_date=end_date, custom_meta_map=custom_meta_map, pro=pro))
+        except Exception as exc:
+            rows.append({
+                "file_path": file_path,
+                "ts_code": Path(file_path).name.split("_", 1)[0],
+                "old_max": "",
+                "new_max": "",
+                "new_rows": 0,
+                "adj_rows": 0,
+                "factor_rows": 0,
+                "status": "error",
+                "message": str(exc),
+            })
         time.sleep(0.2)
 
     out = pd.DataFrame(rows)
